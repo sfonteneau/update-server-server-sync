@@ -1570,7 +1570,7 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, $fileBlob, $fileC
                     throw new KeyNotFoundException();
                 }
 
-                if (string.Equals(indexName, AvailableIndexes.FilesIndexName, StringComparison.Ordinal) &&
+                if (string.Equals(indexName, Microsoft.PackageGraph.MicrosoftUpdate.Index.AvailableIndexes.FilesIndexName, StringComparison.Ordinal) &&
                     typeof(T) == typeof(UpdateFile))
                 {
                     value = GetFiles<UpdateFile>(packageIdentity).Cast<T>().ToList();
