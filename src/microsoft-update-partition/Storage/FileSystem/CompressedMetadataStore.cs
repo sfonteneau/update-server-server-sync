@@ -121,7 +121,7 @@ namespace Microsoft.PackageGraph.Storage.Local
                     OutputFile.Dispose();
                     OutputFile = null;
                 }
-                else if (InputFile == null)
+                else if (InputFile != null)
                 {
                     InputFile.Close();
                     InputFile = null;

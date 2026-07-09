@@ -481,12 +481,14 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
 
                 if (requestedDigests.Count > 0)
                 {
-                    var files = MetadataSource
-                        .OfType<MicrosoftUpdatePackage>()
-                        .Where(u => u.Files != null && u.Files.Any())
-                        .SelectMany(u => u.Files.OfType<UpdateFile>())
-                        .Distinct()
-                        .ToList();
+                    var files = MetadataSource is IMicrosoftUpdateFileLocationLookup fileLocationLookup
+                        ? fileLocationLookup.FindFilesBySha1(fileDigests ?? Array.Empty<byte[]>()).Distinct().ToList()
+                        : MetadataSource
+                            .OfType<MicrosoftUpdatePackage>()
+                            .Where(u => u.Files != null && u.Files.Any())
+                            .SelectMany(u => u.Files.OfType<UpdateFile>())
+                            .Distinct()
+                            .ToList();
 
                     foreach (var file in files)
                     {
