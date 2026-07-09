@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
 using System;
@@ -14,6 +14,7 @@ using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Drivers;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Prerequisites;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Content;
+using Microsoft.PackageGraph.ObjectModel;
 using System.Text;
 
 namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
@@ -66,12 +67,78 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         }
 
         /// <summary>
-        /// Sets the host name for the server that serves the update content
+        /// Sets the host name for the server that serves the update content.
+        /// Microsoft Update URLs are still preferred when they are available in metadata.
         /// </summary>
         /// <param name="hostName"></param>
         public void SetContentURLBase(string hostName)
         {
             ContentRoot = hostName;
+        }
+
+        private string GetPreferredDownloadUrl(UpdateFile file, IContentFileDigest digest)
+        {
+            var urlsForDigest = file.Urls?
+                .Where(u => string.Equals(u.DigestBase64, digest.DigestBase64, StringComparison.Ordinal))
+                .ToList();
+
+            // Preferred mode for this fork: always give Windows the original Microsoft Update/CDN URL
+            // when the upstream metadata contains one. This keeps this server as a metadata/approval
+            // server only; the update payload is downloaded directly from Microsoft by the client.
+            var microsoftUrl = urlsForDigest?
+                .FirstOrDefault(u => !string.IsNullOrEmpty(u.MuUrl))?
+                .MuUrl
+                ?? file.Urls?
+                    .FirstOrDefault(u => !string.IsNullOrEmpty(u.MuUrl))?
+                    .MuUrl;
+
+            if (!string.IsNullOrEmpty(microsoftUrl))
+            {
+                return microsoftUrl;
+            }
+
+            // Fallbacks kept for metadata imported from another WSUS or for local-content deployments.
+            if (!string.IsNullOrEmpty(ContentRoot))
+            {
+                return $"{ContentRoot}/{digest.HexString.ToLowerInvariant()}";
+            }
+
+            return urlsForDigest?
+                .FirstOrDefault(u => !string.IsNullOrEmpty(u.UssUrl))?
+                .UssUrl
+                ?? file.Urls?
+                    .FirstOrDefault(u => !string.IsNullOrEmpty(u.UssUrl))?
+                    .UssUrl;
+        }
+
+        private FileLocation GetFileLocation(UpdateFile file, byte[] requestedDigest = null)
+        {
+            var requestedDigestBase64 = requestedDigest == null ? null : Convert.ToBase64String(requestedDigest);
+
+            var digest = !string.IsNullOrEmpty(requestedDigestBase64)
+                ? file.Digests?.FirstOrDefault(d => string.Equals(d.DigestBase64, requestedDigestBase64, StringComparison.Ordinal))
+                : file.Digests?
+                    .FirstOrDefault(d => file.Urls?.Any(u =>
+                        string.Equals(u.DigestBase64, d.DigestBase64, StringComparison.Ordinal)
+                        && !string.IsNullOrEmpty(u.MuUrl)) == true)
+                    ?? file.Digest;
+
+            if (digest == null)
+            {
+                return null;
+            }
+
+            var url = GetPreferredDownloadUrl(file, digest);
+            if (string.IsNullOrEmpty(url))
+            {
+                return null;
+            }
+
+            return new FileLocation()
+            {
+                FileDigest = Convert.FromBase64String(digest.DigestBase64),
+                Url = url
+            };
         }
 
         /// <summary>
@@ -185,17 +252,98 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         }
 
         /// <summary>
-        /// Not implemented.
+        /// Handle requests for extended update information using global update identities.
+        /// This mirrors GetExtendedUpdateInfoAsync and also returns Microsoft Update/CDN file URLs.
         /// </summary>
-        /// <param name="cookie">Not implemented</param>
-        /// <param name="updateIDs">Not implemented</param>
-        /// <param name="infoTypes">Not implemented</param>
-        /// <param name="locales">Not implemented</param>
-        /// <param name="deviceAttributes">Not implemented</param>
-        /// <returns>Not implemented</returns>
+        /// <param name="cookie">Access cookie</param>
+        /// <param name="updateIDs">Update identities</param>
+        /// <param name="infoTypes">The type of extended information requested</param>
+        /// <param name="locales">The language to use when getting language dependent extended information</param>
+        /// <param name="deviceAttributes">Device attributes; unused</param>
+        /// <returns>Extended update information response.</returns>
         public Task<ExtendedUpdateInfo2> GetExtendedUpdateInfo2Async(Cookie cookie, UpdateIdentity[] updateIDs, XmlUpdateFragmentType[] infoTypes, string[] locales, string deviceAttributes)
         {
-            throw new NotImplementedException();
+            MetadataSourceLock.EnterReadLock();
+
+            try
+            {
+                if (MetadataSource == null)
+                {
+                    throw new FaultException();
+                }
+
+                var requestedUpdates = new List<MicrosoftUpdatePackage>();
+                foreach (var updateID in updateIDs ?? Array.Empty<UpdateIdentity>())
+                {
+                    var packageIdentity = new MicrosoftUpdatePackageIdentity(updateID.UpdateID, updateID.RevisionNumber);
+                    requestedUpdates.Add(MetadataSource.GetPackage(packageIdentity) as MicrosoftUpdatePackage);
+                }
+
+                var updateDataList = new List<UpdateData>();
+
+                if (infoTypes.Contains(XmlUpdateFragmentType.Extended))
+                {
+                    foreach (var requestedUpdate in requestedUpdates)
+                    {
+                        updateDataList.Add(new UpdateData()
+                        {
+                            ID = MetadataSource.GetPackageIndex(requestedUpdate.Id),
+                            Xml = GetExtendedFragment(requestedUpdate.Id)
+                        });
+                    }
+                }
+
+                if (infoTypes.Contains(XmlUpdateFragmentType.LocalizedProperties))
+                {
+                    foreach (var requestedUpdate in requestedUpdates)
+                    {
+                        var localizedXml = GetLocalizedProperties(requestedUpdate.Id, locales);
+
+                        if (!string.IsNullOrEmpty(localizedXml))
+                        {
+                            updateDataList.Add(new UpdateData()
+                            {
+                                ID = MetadataSource.GetPackageIndex(requestedUpdate.Id),
+                                Xml = localizedXml
+                            });
+                        }
+                    }
+                }
+
+                var files = requestedUpdates
+                    .Where(u => u?.Files != null && u.Files.Any())
+                    .SelectMany(u => u.Files.OfType<UpdateFile>())
+                    .Distinct()
+                    .ToList();
+
+                var fileList = new List<FileLocation>();
+                foreach (var file in files)
+                {
+                    var fileLocation = GetFileLocation(file);
+                    if (fileLocation != null)
+                    {
+                        fileList.Add(fileLocation);
+                    }
+                }
+
+                var response = new ExtendedUpdateInfo2();
+
+                if (updateDataList.Count > 0)
+                {
+                    response.Updates = updateDataList.ToArray();
+                }
+
+                if (fileList.Count > 0)
+                {
+                    response.FileLocations = fileList.ToArray();
+                }
+
+                return Task.FromResult(response);
+            }
+            finally
+            {
+                MetadataSourceLock.ExitReadLock();
+            }
         }
 
         string GetCoreFragment(MicrosoftUpdatePackageIdentity updateIdentity)
@@ -285,11 +433,11 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
             var fileList = new List<FileLocation>();
             for (int i = 0; i < files.Count; i++)
             {
-                fileList.Add(new FileLocation()
+                var fileLocation = GetFileLocation(files[i]);
+                if (fileLocation != null)
                 {
-                    FileDigest = Convert.FromBase64String(files[i].Digest.DigestBase64),
-                    Url = string.IsNullOrEmpty(ContentRoot) ? files[i].Urls[0].MuUrl : $"{ContentRoot}/{files[i].Digest.HexString.ToLower()}"
-                });
+                    fileList.Add(fileLocation);
+                }
             }
 
             var response = new ExtendedUpdateInfo();
@@ -310,14 +458,64 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         }
 
         /// <summary>
-        /// Not implemented
+        /// Handle requests for update payload locations.
+        /// Returns Microsoft Update/CDN URLs when they are present in metadata so the client
+        /// downloads content directly from Microsoft instead of from this server.
         /// </summary>
-        /// <param name="cookie"></param>
-        /// <param name="fileDigests"></param>
-        /// <returns>Not implemented</returns>
+        /// <param name="cookie">Access cookie</param>
+        /// <param name="fileDigests">Requested file digests</param>
+        /// <returns>File location response</returns>
         public Task<GetFileLocationsResults> GetFileLocationsAsync(Cookie cookie, byte[][] fileDigests)
         {
-            throw new NotImplementedException();
+            MetadataSourceLock.EnterReadLock();
+
+            try
+            {
+                if (MetadataSource == null)
+                {
+                    throw new FaultException();
+                }
+
+                var requestedDigests = new HashSet<string>((fileDigests ?? Array.Empty<byte[]>()).Select(Convert.ToBase64String));
+                var fileList = new List<FileLocation>();
+
+                if (requestedDigests.Count > 0)
+                {
+                    var files = MetadataSource
+                        .OfType<MicrosoftUpdatePackage>()
+                        .Where(u => u.Files != null && u.Files.Any())
+                        .SelectMany(u => u.Files.OfType<UpdateFile>())
+                        .Distinct()
+                        .ToList();
+
+                    foreach (var file in files)
+                    {
+                        foreach (var digest in file.Digests ?? Enumerable.Empty<ContentFileDigest>())
+                        {
+                            if (!requestedDigests.Contains(digest.DigestBase64))
+                            {
+                                continue;
+                            }
+
+                            var fileLocation = GetFileLocation(file, Convert.FromBase64String(digest.DigestBase64));
+                            if (fileLocation != null)
+                            {
+                                fileList.Add(fileLocation);
+                            }
+                        }
+                    }
+                }
+
+                return Task.FromResult(new GetFileLocationsResults()
+                {
+                    FileLocations = fileList.ToArray(),
+                    NewCookie = cookie
+                });
+            }
+            finally
+            {
+                MetadataSourceLock.ExitReadLock();
+            }
         }
 
         /// <summary>
