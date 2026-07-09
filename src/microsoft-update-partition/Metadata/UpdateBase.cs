@@ -193,7 +193,13 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Metadata
                 }
                 else if (_FastLookupSource != null)
                 {
-                    _FastLookupSource.TryListKeyLookup<UpdateFile>(this._Id, Index.AvailableIndexes.FilesIndexName, out _Files);
+                    if (!_FastLookupSource.TryListKeyLookup<UpdateFile>(this._Id, Index.AvailableIndexes.FilesIndexName, out _Files) || _Files == null)
+                    {
+                        _Files = _MetadataSource != null
+                            ? _MetadataSource.GetFiles<UpdateFile>(this._Id).Cast<UpdateFile>().ToList()
+                            : new List<UpdateFile>();
+                    }
+
                     _FilesLoaded = true;
                 }
                 else if (_MetadataSource != null)
@@ -285,6 +291,22 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Metadata
         }
 
         private byte[] _MetadataBytes;
+
+        /// <summary>
+        /// Returns the compressed metadata bytes exactly as they were kept in memory after upstream retrieval.
+        /// The bytes are GZip-compressed XML and can be stored directly without expanding and recompressing.
+        /// </summary>
+        internal bool TryGetCompressedMetadataBytes(out byte[] metadataBytes)
+        {
+            if (_MetadataBytes == null || _MetadataBytes.Length == 0)
+            {
+                metadataBytes = null;
+                return false;
+            }
+
+            metadataBytes = _MetadataBytes;
+            return true;
+        }
 
         /// <summary>
         /// Matches keywords in the title of the update

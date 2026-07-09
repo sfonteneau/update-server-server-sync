@@ -40,8 +40,7 @@ namespace Microsoft.PackageGraph.Partitions
                             MicrosoftUpdatePartitionRegistration.IsBundle,
                             MicrosoftUpdatePartitionRegistration.BundledWith,
                             MicrosoftUpdatePartitionRegistration.Prerequisites,
-                            MicrosoftUpdatePartitionRegistration.Categories,
-                            MicrosoftUpdatePartitionRegistration.Files
+                            MicrosoftUpdatePartitionRegistration.Categories
                         }
                     }
                 }

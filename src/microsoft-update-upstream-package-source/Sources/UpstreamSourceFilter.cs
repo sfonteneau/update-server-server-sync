@@ -40,6 +40,20 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         [JsonProperty]
         public List<Guid> ClassificationsFilter { get; internal set; }
 
+        /// <summary>
+        /// Gets the LCIDs of the languages requested from the upstream server.
+        /// If empty, the upstream language filter is not sent.
+        /// </summary>
+        /// <value>List of language LCIDs.</value>
+        [JsonProperty]
+        public List<int> LanguagesFilter { get; internal set; }
+
+        /// <summary>
+        /// When true, localized metadata for languages that are not in <see cref="LanguagesFilter"/>
+        /// is removed before the update is stored locally. This does not drop update revisions.
+        /// </summary>
+        [JsonProperty]
+        public bool StripUnrequestedLocalizedProperties { get; internal set; }
 
         /// <summary>
         /// Creates an empty filter.
@@ -49,6 +63,8 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         {
             ProductsFilter = new List<Guid>();
             ClassificationsFilter = new List<Guid>();
+            LanguagesFilter = new List<int>();
+            StripUnrequestedLocalizedProperties = false;
         }
 
         /// <summary>
@@ -57,9 +73,23 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// <param name="products">The products to match</param>
         /// <param name="classifications">The classifications to match</param>
         public UpstreamSourceFilter(IEnumerable<Guid> products, IEnumerable<Guid> classifications)
+            : this(products, classifications, Array.Empty<int>(), false)
         {
-            ProductsFilter = new List<Guid>(products);
-            ClassificationsFilter = new List<Guid>(classifications);
+        }
+
+        /// <summary>
+        /// Initialize a new SourceFilter from the specified products, classifications and languages.
+        /// </summary>
+        /// <param name="products">The products to match</param>
+        /// <param name="classifications">The classifications to match</param>
+        /// <param name="languages">The language LCIDs to request</param>
+        /// <param name="stripUnrequestedLocalizedProperties">Whether to strip localized properties outside the requested languages before local storage</param>
+        public UpstreamSourceFilter(IEnumerable<Guid> products, IEnumerable<Guid> classifications, IEnumerable<int> languages, bool stripUnrequestedLocalizedProperties)
+        {
+            ProductsFilter = new List<Guid>(products ?? Array.Empty<Guid>());
+            ClassificationsFilter = new List<Guid>(classifications ?? Array.Empty<Guid>());
+            LanguagesFilter = new List<int>((languages ?? Array.Empty<int>()).Distinct());
+            StripUnrequestedLocalizedProperties = stripUnrequestedLocalizedProperties;
         }
 
         /// <summary>
@@ -68,7 +98,13 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// <returns>A ServerSyncFilter instance</returns>
         internal ServerSyncFilter ToServerSyncFilter(string anchor = null)
         {
-            ServerSyncFilter filter = new();
+            ServerSyncFilter filter = new()
+            {
+                Anchor = anchor,
+                // The generated proxy targets a protocol version that has this field.
+                // TRUE means this DSS only asks for a bounded language set.
+                Get63LanguageOnly = true
+            };
 
             if (ProductsFilter.Count > 0)
             {
@@ -98,7 +134,16 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
                 }
             }
 
-            filter.Anchor = anchor;
+            if (LanguagesFilter.Count > 0)
+            {
+                filter.Languages = LanguagesFilter
+                    .Select(languageId => new LanguageAndDelta
+                    {
+                        Id = languageId,
+                        Delta = !string.IsNullOrEmpty(anchor)
+                    })
+                    .ToArray();
+            }
 
             return filter;
         }
@@ -120,13 +165,16 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
 
             var other = obj as UpstreamSourceFilter;
             if (this.ProductsFilter.Count != other.ProductsFilter.Count ||
-                this.ClassificationsFilter.Count != other.ClassificationsFilter.Count)
+                this.ClassificationsFilter.Count != other.ClassificationsFilter.Count ||
+                this.LanguagesFilter.Count != other.LanguagesFilter.Count ||
+                this.StripUnrequestedLocalizedProperties != other.StripUnrequestedLocalizedProperties)
             {
                 return false;
             }
 
             return this.ProductsFilter.All(cat => other.ProductsFilter.Contains(cat))
-                && this.ClassificationsFilter.All(cat => other.ClassificationsFilter.Contains(cat));
+                && this.ClassificationsFilter.All(cat => other.ClassificationsFilter.Contains(cat))
+                && this.LanguagesFilter.All(language => other.LanguagesFilter.Contains(language));
         }
 
         /// <summary>
@@ -170,9 +218,10 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// <returns>Hash code</returns>
         public override int GetHashCode()
         {
-            int hash = 0;
+            int hash = StripUnrequestedLocalizedProperties.GetHashCode();
             this.ProductsFilter.ForEach(cat => hash |= cat.GetHashCode());
             this.ClassificationsFilter.ForEach(cat => hash |= cat.GetHashCode());
+            this.LanguagesFilter.ForEach(language => hash |= language.GetHashCode());
 
             return hash;
         }

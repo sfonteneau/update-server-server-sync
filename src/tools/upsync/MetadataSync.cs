@@ -287,6 +287,67 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
             return filterList;
         }
 
+        private static List<int> CreateLanguageFilterFromOptions(FetchPackagesOptions options)
+        {
+            var languageOptions = options.LanguageFilter?.ToList() ?? new List<string>();
+            if (languageOptions.Count == 0)
+            {
+                // Default to English only. This avoids syncing every localized metadata branch.
+                return new List<int> { 1033 };
+            }
+
+            if (languageOptions.Any(language =>
+                string.Equals(language, "all", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(language, "*", StringComparison.OrdinalIgnoreCase)))
+            {
+                return new List<int>();
+            }
+
+            var languages = new List<int>();
+            foreach (var language in languageOptions)
+            {
+                if (int.TryParse(language, out var lcid))
+                {
+                    languages.Add(lcid);
+                    continue;
+                }
+
+                var normalizedLanguage = language.Trim().ToLowerInvariant();
+                switch (normalizedLanguage)
+                {
+                    case "en":
+                    case "en-us":
+                    case "english":
+                        languages.Add(1033);
+                        break;
+                    case "fr":
+                    case "fr-fr":
+                    case "french":
+                        languages.Add(1036);
+                        break;
+                    case "de":
+                    case "de-de":
+                    case "german":
+                        languages.Add(1031);
+                        break;
+                    case "es":
+                    case "es-es":
+                    case "spanish":
+                        languages.Add(3082);
+                        break;
+                    case "it":
+                    case "it-it":
+                    case "italian":
+                        languages.Add(1040);
+                        break;
+                    default:
+                        throw new Exception($"Unsupported language filter '{language}'. Use an LCID such as 1033, a known short name such as en, or all.");
+                }
+            }
+
+            return languages.Distinct().ToList();
+        }
+
         private static UpstreamSourceFilter CreateValidFilterFromOptions(FetchPackagesOptions options, IMetadataStore metadataSource)
         {
             List<Guid> productFilter = CreateFilterListForCategory<ProductCategory>(
@@ -297,7 +358,10 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
                 options.ClassificationsFilter,
                 metadataSource);
 
-            return new UpstreamSourceFilter(productFilter, classificationFilter);
+            List<int> languageFilter = CreateLanguageFilterFromOptions(options);
+            bool stripUnrequestedLocalizedProperties = languageFilter.Count > 0 && !options.KeepAllLocalizedProperties;
+
+            return new UpstreamSourceFilter(productFilter, classificationFilter, languageFilter, stripUnrequestedLocalizedProperties);
         }
     }
 }

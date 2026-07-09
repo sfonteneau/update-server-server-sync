@@ -120,6 +120,28 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
         public bool ForceReindex { get; set; }
     }
 
+    [Verb("compact-store", HelpText = "Compresses and compacts a local SQLite metadata store")]
+    public class CompactStoreOptions : IMetadataStoreOptions
+    {
+        [Option("store-alias", Required = false, HelpText = "Store alias")]
+        public string Alias { get; set; }
+
+        [Option("store-path", Required = false, HelpText = "Local store directory to compact")]
+        public string Path { get; set; }
+
+        [Option("store-type", Required = false, Default = "local", HelpText = "Store type; only local is supported for compaction")]
+        public string Type { get; set; }
+
+        [Option("connection-string", Required = false, HelpText = "Unused for local compaction")]
+        public string StoreConnectionString { get; set; }
+
+        [Option("replace", Required = false, Default = true, HelpText = "Replace metadata.sqlite with a VACUUM INTO compact copy and keep the previous file as backup")]
+        public bool ReplaceDatabaseFile { get; set; }
+
+        [Option("reindex", Required = false, Default = true, HelpText = "Rebuild indexes after compaction. Recommended to remove the old file-location index payload")]
+        public bool RebuildIndexes { get; set; }
+    }
+
     [Verb("fetch", HelpText = "Retrieves metadata from an upstream server")]
     public class FetchPackagesOptions : IMetadataStoreOptions, IMetadataSourceOptions
     {
@@ -151,6 +173,12 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
 
         [Option("classification-filter", Required = false, Separator = '+', HelpText = "Classification filter for sync'ing updates")]
         public IEnumerable<string> ClassificationsFilter { get; set; }
+
+        [Option("language-filter", Required = false, Separator = '+', HelpText = "Language LCIDs or short names to sync. Default: 1033/en. Use all to disable the language filter")]
+        public IEnumerable<string> LanguageFilter { get; set; }
+
+        [Option("keep-all-localized-properties", Required = false, Default = false, HelpText = "Do not strip non-requested LocalizedProperties from stored metadata")]
+        public bool KeepAllLocalizedProperties { get; set; }
 
         [Option("account-name", Required = false, HelpText = "Account name; if not set, a random GUID is used.")]
         public string AccountName { get; set; }

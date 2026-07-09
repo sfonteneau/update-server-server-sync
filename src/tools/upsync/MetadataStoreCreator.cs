@@ -107,13 +107,54 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
             return new List<StoreAliasCreateOptions>();
         }
 
+        public static void CompactStore(CompactStoreOptions options)
+        {
+            IMetadataStoreOptions sourceOptions = options;
+            if (!string.IsNullOrEmpty(sourceOptions.Alias))
+            {
+                List<StoreAliasCreateOptions> storeAliases = LoadStoreAliases(StoreAliasesConfigFile);
+                var alias = sourceOptions.Alias;
+                sourceOptions = storeAliases.FirstOrDefault(aliasEntry => aliasEntry.Alias == sourceOptions.Alias);
+                if (sourceOptions == null)
+                {
+                    Console.WriteLine($"Alias {alias} not found");
+                    return;
+                }
+            }
+
+            if (!string.Equals(sourceOptions.Type, "local", StringComparison.OrdinalIgnoreCase))
+            {
+                ConsoleOutput.WriteRed("compact-store only supports local SQLite stores.");
+                return;
+            }
+
+            if (string.IsNullOrEmpty(sourceOptions.Path))
+            {
+                ConsoleOutput.WriteRed("Missing --store-path or --store-alias.");
+                return;
+            }
+
+            try
+            {
+                PackageStore.OptimizeSQLiteStore(
+                    sourceOptions.Path,
+                    options.ReplaceDatabaseFile,
+                    options.RebuildIndexes,
+                    message => Console.WriteLine(message));
+            }
+            catch (Exception ex)
+            {
+                ConsoleOutput.WriteRed($"Cannot compact the package store: {ex.Message}");
+            }
+        }
+
         public static IMetadataStore OpenFromOptions(IMetadataStoreOptions sourceOptions)
         {
             if (!string.IsNullOrEmpty(sourceOptions.Alias))
             {
                 List<StoreAliasCreateOptions> storeAliases = LoadStoreAliases(StoreAliasesConfigFile);
                 var alias = sourceOptions.Alias;
-                sourceOptions = storeAliases.FirstOrDefault(alias => alias.Alias == sourceOptions.Alias);
+                sourceOptions = storeAliases.FirstOrDefault(aliasEntry => aliasEntry.Alias == sourceOptions.Alias);
                 if (sourceOptions == null)
                 {
                     Console.WriteLine($"Alias {alias} not found");
@@ -180,7 +221,7 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
             {
                 List<StoreAliasCreateOptions> storeAliases = LoadStoreAliases(StoreAliasesConfigFile);
                 var alias = sourceOptions.Alias;
-                sourceOptions = storeAliases.FirstOrDefault(alias => alias.Alias == sourceOptions.Alias);
+                sourceOptions = storeAliases.FirstOrDefault(aliasEntry => aliasEntry.Alias == sourceOptions.Alias);
                 if (sourceOptions == null)
                 {
                     Console.WriteLine($"Alias {alias} not found");

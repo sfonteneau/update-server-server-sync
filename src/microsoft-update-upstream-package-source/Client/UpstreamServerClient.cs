@@ -266,7 +266,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// Retrieves update data for the list of update ids
         /// </summary>
         /// <param name="updateIds">The ids to retrieve data for</param>
-        internal List<MicrosoftUpdatePackage> GetUpdateDataForIds(List<MicrosoftUpdatePackageIdentity> updateIds)
+        internal List<MicrosoftUpdatePackage> GetUpdateDataForIds(List<MicrosoftUpdatePackageIdentity> updateIds, UpstreamSourceFilter sourceFilter = null)
         {
             if (AccessToken == null || AccessToken.ExpiresIn(TimeSpan.FromMinutes(2)))
             {
@@ -332,7 +332,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
 
                 foreach (var rawUpdate in updateDataReply.GetUpdateDataResponse1.GetUpdateDataResult.updates)
                 {
-                    packages.Add(InMemoryUpdateFactory.FromServerSyncData(rawUpdate, filesList));
+                    packages.Add(InMemoryUpdateFactory.FromServerSyncData(rawUpdate, filesList, sourceFilter));
                 }
             });
 

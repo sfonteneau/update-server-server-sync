@@ -65,6 +65,32 @@ namespace Microsoft.PackageGraph.Storage.Local
             return SQLitePackageStore.Exists(path) || DirectoryPackageStore.Exists(path);
         }
 
+        /// <summary>
+        /// Optimizes a local SQLite package store by compressing old uncompressed rows,
+        /// rebuilding compact lookup tables and optionally replacing metadata.sqlite with
+        /// a VACUUM INTO compact copy.
+        /// </summary>
+        /// <param name="path">Path to the local package store directory.</param>
+        /// <param name="replaceDatabaseFile">When true, replaces metadata.sqlite with a compact copy and keeps the previous file as a backup.</param>
+        /// <param name="rebuildIndexes">When true, rebuilds indexes. This also drops the old full file-location index payload.</param>
+        /// <param name="log">Optional progress callback.</param>
+        public static void OptimizeSQLiteStore(string path, bool replaceDatabaseFile, bool rebuildIndexes, Action<string> log = null)
+        {
+            if (!Directory.Exists(path))
+            {
+                throw new DirectoryNotFoundException(path);
+            }
+
+            MigrateLegacyZipStoreIfNeeded(path);
+
+            if (!SQLitePackageStore.Exists(path))
+            {
+                throw new DirectoryNotFoundException($"No SQLite metadata store found in {path}");
+            }
+
+            SQLitePackageStore.OptimizeExisting(path, replaceDatabaseFile, rebuildIndexes, log);
+        }
+
         private static void MigrateLegacyZipStoreIfNeeded(string path)
         {
             if (SQLitePackageStore.Exists(path) || !DirectoryPackageStore.Exists(path))

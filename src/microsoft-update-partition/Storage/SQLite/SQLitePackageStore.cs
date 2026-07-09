@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 using Microsoft.Data.Sqlite;
+using Microsoft.PackageGraph.MicrosoftUpdate.Index;
+using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Content;
 using Microsoft.PackageGraph.ObjectModel;
 using Microsoft.PackageGraph.Partitions;
@@ -11,6 +13,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Text;
 using System.Threading;
@@ -28,8 +31,12 @@ namespace Microsoft.PackageGraph.Storage.Local
     {
         public const string DatabaseFileName = "metadata.sqlite";
 
-        private const int SchemaVersion = 1;
+        private const int SchemaVersion = 2;
         private const string IndexBlobKey = "indexes.zip";
+        private const string CompressionNone = "none";
+        private const string CompressionBrotli = "br";
+        private const string CompressionGZip = "gzip";
+        private const int OptimizeBatchSize = 200;
 
         private readonly string TargetPath;
         private readonly string DatabasePath;
@@ -45,6 +52,7 @@ namespace Microsoft.PackageGraph.Storage.Local
         private bool IsIndexDirty;
         private bool IsDisposed;
         private bool _IsReindexingRequired;
+        private bool _FileLocationFileJsonIsRequired;
 
         private MemoryStream IndexBackingStream;
         private ZipStreamIndexContainer Indexes;
@@ -66,7 +74,7 @@ namespace Microsoft.PackageGraph.Storage.Local
         /// <inheritdoc cref="IMetadataStore.IsMetadataIndexingSupported"/>
         public bool IsMetadataIndexingSupported { get; private set; } = true;
 
-        private SQLitePackageStore(string path, FileMode mode)
+        private SQLitePackageStore(string path, FileMode mode, bool autoReindex = true)
         {
             TargetPath = path;
             DatabasePath = Path.Combine(TargetPath, DatabaseFileName);
@@ -86,6 +94,8 @@ namespace Microsoft.PackageGraph.Storage.Local
                 throw new FileNotFoundException("The SQLite metadata store does not exist", DatabasePath);
             }
 
+            var isNewDatabase = !File.Exists(DatabasePath);
+
             var connectionString = new SqliteConnectionStringBuilder
             {
                 DataSource = DatabasePath,
@@ -96,15 +106,22 @@ namespace Microsoft.PackageGraph.Storage.Local
             Connection = new SqliteConnection(connectionString);
             Connection.Open();
 
+            if (isNewDatabase)
+            {
+                ExecuteNonQuery("PRAGMA page_size=8192;");
+                ExecuteNonQuery("PRAGMA auto_vacuum=INCREMENTAL;");
+            }
+
             ExecuteNonQuery("PRAGMA journal_mode=WAL;");
             ExecuteNonQuery("PRAGMA synchronous=NORMAL;");
             ExecuteNonQuery("PRAGMA foreign_keys=ON;");
 
             InitializeSchema();
+            EnsureCompressionSchema();
             LoadPackageMaps();
             LoadIndexes();
 
-            if (_IsReindexingRequired)
+            if (autoReindex && _IsReindexingRequired)
             {
                 CheckIndex(true);
                 Flush();
@@ -141,7 +158,10 @@ CREATE TABLE IF NOT EXISTS packages (
     identity TEXT NOT NULL,
     package_type INTEGER NOT NULL,
     metadata BLOB NOT NULL,
+    metadata_compression TEXT NOT NULL DEFAULT 'br',
     files_json TEXT NULL,
+    files_blob BLOB NULL,
+    files_compression TEXT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(partition, open_id_hex),
     UNIQUE(identity)
@@ -164,13 +184,26 @@ CREATE TABLE IF NOT EXISTS file_locations (
     sha1_hex TEXT NOT NULL,
     mu_url TEXT NULL,
     file_name TEXT NULL,
-    file_json TEXT NOT NULL,
+    file_json TEXT NULL,
+    file_blob BLOB NULL,
+    file_compression TEXT NULL,
     package_index INTEGER NOT NULL,
     FOREIGN KEY(package_index) REFERENCES packages(package_index) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_file_locations_package
 ON file_locations(package_index);
+
+CREATE TABLE IF NOT EXISTS package_file_map (
+    package_index INTEGER NOT NULL,
+    sha1_base64 TEXT NOT NULL,
+    PRIMARY KEY(package_index, sha1_base64),
+    FOREIGN KEY(package_index) REFERENCES packages(package_index) ON DELETE CASCADE,
+    FOREIGN KEY(sha1_base64) REFERENCES file_locations(sha1_base64) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_package_file_map_sha1
+ON package_file_map(sha1_base64);
 ");
 
             using var command = Connection.CreateCommand();
@@ -180,6 +213,65 @@ VALUES ('schema_version', $schemaVersion)
 ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
             command.Parameters.AddWithValue("$schemaVersion", SchemaVersion.ToString());
             command.ExecuteNonQuery();
+        }
+
+        private void EnsureCompressionSchema()
+        {
+            EnsureColumnExists("packages", "metadata_compression", "TEXT NOT NULL DEFAULT 'none'");
+            EnsureColumnExists("packages", "files_blob", "BLOB NULL");
+            EnsureColumnExists("packages", "files_compression", "TEXT NULL");
+            EnsureColumnExists("file_locations", "file_blob", "BLOB NULL");
+            EnsureColumnExists("file_locations", "file_compression", "TEXT NULL");
+
+            ExecuteNonQuery(@"
+INSERT OR IGNORE INTO package_file_map(package_index, sha1_base64)
+SELECT package_index, sha1_base64
+FROM file_locations
+WHERE package_index IS NOT NULL;");
+
+            _FileLocationFileJsonIsRequired = IsColumnNotNull("file_locations", "file_json");
+        }
+
+        private void EnsureColumnExists(string tableName, string columnName, string columnDefinition)
+        {
+            if (ColumnExists(tableName, columnName))
+            {
+                return;
+            }
+
+            ExecuteNonQuery($"ALTER TABLE {tableName} ADD COLUMN {columnName} {columnDefinition};");
+        }
+
+        private bool ColumnExists(string tableName, string columnName)
+        {
+            using var command = Connection.CreateCommand();
+            command.CommandText = $"PRAGMA table_info({tableName});";
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                if (string.Equals(reader.GetString(1), columnName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private bool IsColumnNotNull(string tableName, string columnName)
+        {
+            using var command = Connection.CreateCommand();
+            command.CommandText = $"PRAGMA table_info({tableName});";
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                if (string.Equals(reader.GetString(1), columnName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return reader.GetInt32(3) != 0;
+                }
+            }
+
+            return false;
         }
 
         private void LoadPackageMaps()
@@ -465,15 +557,21 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
         private byte[] ReadMetadataBytes(int packageIndex)
         {
             using var command = Connection.CreateCommand();
-            command.CommandText = "SELECT metadata FROM packages WHERE package_index = $packageIndex;";
+            command.CommandText = @"
+SELECT metadata, COALESCE(metadata_compression, 'none')
+FROM packages
+WHERE package_index = $packageIndex;";
             command.Parameters.AddWithValue("$packageIndex", packageIndex);
-            var value = command.ExecuteScalar();
-            if (value == null || value == DBNull.Value)
+
+            using var reader = command.ExecuteReader();
+            if (!reader.Read())
             {
                 throw new KeyNotFoundException();
             }
 
-            return (byte[])value;
+            var metadata = (byte[])reader[0];
+            var compression = reader.IsDBNull(1) ? CompressionNone : reader.GetString(1);
+            return DecompressBytes(metadata, compression);
         }
 
         public List<T> GetFiles<T>(IPackageIdentity packageIdentity)
@@ -484,6 +582,16 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
                 if (!_IdentityToIndexMap.TryGetValue(packageIdentity, out var packageIndex))
                 {
                     throw new KeyNotFoundException();
+                }
+
+                var mappedFileJsonList = ReadMappedFileJsonList(packageIndex);
+                if (mappedFileJsonList.Count > 0)
+                {
+                    return mappedFileJsonList
+                        .Select(fileJson => JsonConvert.DeserializeObject<UpdateFile>(fileJson))
+                        .Where(file => file != null)
+                        .Cast<T>()
+                        .ToList();
                 }
 
                 var filesJson = ReadFilesJson(packageIndex);
@@ -500,13 +608,59 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
             }
         }
 
+        private List<string> ReadMappedFileJsonList(int packageIndex)
+        {
+            var filesJson = new List<string>();
+            using var command = Connection.CreateCommand();
+            command.CommandText = @"
+SELECT fl.file_blob, fl.file_compression, fl.file_json
+FROM package_file_map pfm
+JOIN file_locations fl ON fl.sha1_base64 = pfm.sha1_base64
+WHERE pfm.package_index = $packageIndex
+ORDER BY pfm.sha1_base64;";
+            command.Parameters.AddWithValue("$packageIndex", packageIndex);
+
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                if (!reader.IsDBNull(0))
+                {
+                    var blob = (byte[])reader[0];
+                    var compression = reader.IsDBNull(1) ? CompressionNone : reader.GetString(1);
+                    filesJson.Add(DecompressString(blob, compression));
+                }
+                else if (!reader.IsDBNull(2))
+                {
+                    filesJson.Add(reader.GetString(2));
+                }
+            }
+
+            return filesJson;
+        }
+
         private string ReadFilesJson(int packageIndex)
         {
             using var command = Connection.CreateCommand();
-            command.CommandText = "SELECT files_json FROM packages WHERE package_index = $packageIndex;";
+            command.CommandText = @"
+SELECT files_blob, files_compression, files_json
+FROM packages
+WHERE package_index = $packageIndex;";
             command.Parameters.AddWithValue("$packageIndex", packageIndex);
-            var value = command.ExecuteScalar();
-            return value == null || value == DBNull.Value ? null : (string)value;
+
+            using var reader = command.ExecuteReader();
+            if (!reader.Read())
+            {
+                return null;
+            }
+
+            if (!reader.IsDBNull(0))
+            {
+                var blob = (byte[])reader[0];
+                var compression = reader.IsDBNull(1) ? CompressionNone : reader.GetString(1);
+                return DecompressString(blob, compression);
+            }
+
+            return reader.IsDBNull(2) ? null : reader.GetString(2);
         }
 
         public IReadOnlyList<UpdateFile> FindFilesBySha1(IEnumerable<byte[]> sha1Digests)
@@ -532,7 +686,10 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
             {
                 var files = new List<UpdateFile>();
                 using var command = Connection.CreateCommand();
-                command.CommandText = "SELECT file_json FROM file_locations WHERE sha1_base64 = $sha1;";
+                command.CommandText = @"
+SELECT file_blob, file_compression, file_json
+FROM file_locations
+WHERE sha1_base64 = $sha1;";
                 var parameter = command.CreateParameter();
                 parameter.ParameterName = "$sha1";
                 command.Parameters.Add(parameter);
@@ -540,13 +697,29 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
                 foreach (var digest in requested)
                 {
                     parameter.Value = digest;
-                    var value = command.ExecuteScalar();
-                    if (value == null || value == DBNull.Value)
+                    using var reader = command.ExecuteReader();
+                    if (!reader.Read())
                     {
                         continue;
                     }
 
-                    var file = JsonConvert.DeserializeObject<UpdateFile>((string)value);
+                    string fileJson;
+                    if (!reader.IsDBNull(0))
+                    {
+                        var blob = (byte[])reader[0];
+                        var compression = reader.IsDBNull(1) ? CompressionNone : reader.GetString(1);
+                        fileJson = DecompressString(blob, compression);
+                    }
+                    else if (!reader.IsDBNull(2))
+                    {
+                        fileJson = reader.GetString(2);
+                    }
+                    else
+                    {
+                        continue;
+                    }
+
+                    var file = JsonConvert.DeserializeObject<UpdateFile>(fileJson);
                     if (file != null)
                     {
                         files.Add(file);
@@ -594,10 +767,11 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
 
                     var packageIndex = _NextPackageIndex + stagedPackages.Count;
                     var packageType = GetPackageType(package);
-                    var metadataBytes = ReadAllBytes(package.GetMetadataStream());
-                    var filesJson = SerializeFiles(package);
+                    var metadataStorage = GetMetadataStorageBytes(package);
 
-                    InsertPackage(package, packageIndex, packageType, metadataBytes, filesJson, transaction);
+                    // Do not store the full per-package file list here. File metadata is deduplicated
+                    // by SHA1 in file_locations and associated to packages through package_file_map.
+                    InsertPackage(package, packageIndex, packageType, metadataStorage.Bytes, metadataStorage.Compression, null, transaction);
                     InsertFileLocations(package, packageIndex, transaction);
 
                     stagedPackages.Add(new StagedPackage
@@ -643,6 +817,75 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
             }
         }
 
+        private static (byte[] Bytes, string Compression) GetMetadataStorageBytes(IPackage package)
+        {
+            if (package is MicrosoftUpdatePackage microsoftUpdatePackage &&
+                microsoftUpdatePackage.TryGetCompressedMetadataBytes(out var compressedMetadataBytes))
+            {
+                return (compressedMetadataBytes, CompressionGZip);
+            }
+
+            // Fallback for packages rehydrated from stores or other sources: keep the XML bytes once,
+            // without expanding into secondary file payloads. Compression is not used as a substitute
+            // for correct filtering/deduplication.
+            return (ReadAllBytes(package.GetMetadataStream()), CompressionNone);
+        }
+
+        private static byte[] CompressString(string value)
+        {
+            return value == null ? null : CompressBytes(Encoding.UTF8.GetBytes(value));
+        }
+
+        private static string DecompressString(byte[] value, string compression)
+        {
+            return value == null ? null : Encoding.UTF8.GetString(DecompressBytes(value, compression));
+        }
+
+        private static byte[] CompressBytes(byte[] value)
+        {
+            if (value == null || value.Length == 0)
+            {
+                return value;
+            }
+
+            using var output = new MemoryStream();
+            using (var compressor = new BrotliStream(output, CompressionLevel.Optimal, true))
+            {
+                compressor.Write(value, 0, value.Length);
+            }
+
+            return output.ToArray();
+        }
+
+        private static byte[] DecompressBytes(byte[] value, string compression)
+        {
+            if (value == null || value.Length == 0 || string.IsNullOrEmpty(compression) ||
+                string.Equals(compression, CompressionNone, StringComparison.OrdinalIgnoreCase))
+            {
+                return value;
+            }
+
+            using var input = new MemoryStream(value, false);
+            using var output = new MemoryStream();
+
+            if (string.Equals(compression, CompressionBrotli, StringComparison.OrdinalIgnoreCase))
+            {
+                using var decompressor = new BrotliStream(input, CompressionMode.Decompress);
+                decompressor.CopyTo(output);
+            }
+            else if (string.Equals(compression, CompressionGZip, StringComparison.OrdinalIgnoreCase))
+            {
+                using var decompressor = new GZipStream(input, CompressionMode.Decompress);
+                decompressor.CopyTo(output);
+            }
+            else
+            {
+                throw new InvalidDataException($"Unsupported metadata compression format: {compression}");
+            }
+
+            return output.ToArray();
+        }
+
         private static byte[] ReadAllBytes(Stream stream)
         {
             if (stream == null)
@@ -681,20 +924,22 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
             return null;
         }
 
-        private void InsertPackage(IPackage package, int packageIndex, int packageType, byte[] metadataBytes, string filesJson, SqliteTransaction transaction)
+        private void InsertPackage(IPackage package, int packageIndex, int packageType, byte[] metadataBytes, string metadataCompression, byte[] filesBlob, SqliteTransaction transaction)
         {
             using var command = Connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText = @"
-INSERT INTO packages(package_index, partition, open_id_hex, identity, package_type, metadata, files_json)
-VALUES ($packageIndex, $partition, $openIdHex, $identity, $packageType, $metadata, $filesJson);";
+INSERT INTO packages(package_index, partition, open_id_hex, identity, package_type, metadata, metadata_compression, files_json, files_blob, files_compression)
+VALUES ($packageIndex, $partition, $openIdHex, $identity, $packageType, $metadata, $metadataCompression, NULL, $filesBlob, $filesCompression);";
             command.Parameters.AddWithValue("$packageIndex", packageIndex);
             command.Parameters.AddWithValue("$partition", package.Id.Partition);
             command.Parameters.AddWithValue("$openIdHex", package.Id.OpenIdHex);
             command.Parameters.AddWithValue("$identity", package.Id.ToString());
             command.Parameters.AddWithValue("$packageType", packageType);
             command.Parameters.AddWithValue("$metadata", metadataBytes);
-            command.Parameters.AddWithValue("$filesJson", (object)filesJson ?? DBNull.Value);
+            command.Parameters.AddWithValue("$metadataCompression", metadataCompression);
+            command.Parameters.AddWithValue("$filesBlob", (object)filesBlob ?? DBNull.Value);
+            command.Parameters.AddWithValue("$filesCompression", filesBlob == null ? DBNull.Value : (object)CompressionBrotli);
             command.ExecuteNonQuery();
         }
 
@@ -726,28 +971,45 @@ VALUES ($packageIndex, $partition, $openIdHex, $identity, $packageType, $metadat
                 }
 
                 var fileJson = JsonConvert.SerializeObject(file);
+                var fileBlob = CompressString(fileJson);
                 var preferredUrl = GetPreferredUrl(file, sha1.DigestBase64);
 
-                using var command = Connection.CreateCommand();
-                command.Transaction = transaction;
-                command.CommandText = @"
-INSERT INTO file_locations(sha1_base64, sha1, sha1_hex, mu_url, file_name, file_json, package_index)
-VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, $fileJson, $packageIndex)
+                using (var command = Connection.CreateCommand())
+                {
+                    command.Transaction = transaction;
+                    command.CommandText = @"
+INSERT INTO file_locations(sha1_base64, sha1, sha1_hex, mu_url, file_name, file_json, file_blob, file_compression, package_index)
+VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, $fileJson, $fileBlob, $fileCompression, $packageIndex)
 ON CONFLICT(sha1_base64) DO UPDATE SET
     sha1 = excluded.sha1,
     sha1_hex = excluded.sha1_hex,
     mu_url = COALESCE(excluded.mu_url, file_locations.mu_url),
-    file_name = excluded.file_name,
-    file_json = excluded.file_json,
-    package_index = excluded.package_index;";
-                command.Parameters.AddWithValue("$sha1Base64", sha1.DigestBase64);
-                command.Parameters.AddWithValue("$sha1", sha1Bytes);
-                command.Parameters.AddWithValue("$sha1Hex", BitConverter.ToString(sha1Bytes).Replace("-", ""));
-                command.Parameters.AddWithValue("$muUrl", (object)preferredUrl ?? DBNull.Value);
-                command.Parameters.AddWithValue("$fileName", (object)file.FileName ?? DBNull.Value);
-                command.Parameters.AddWithValue("$fileJson", fileJson);
-                command.Parameters.AddWithValue("$packageIndex", packageIndex);
-                command.ExecuteNonQuery();
+    file_name = COALESCE(excluded.file_name, file_locations.file_name),
+    file_json = COALESCE(excluded.file_json, file_locations.file_json),
+    file_blob = COALESCE(excluded.file_blob, file_locations.file_blob),
+    file_compression = COALESCE(excluded.file_compression, file_locations.file_compression);";
+                    command.Parameters.AddWithValue("$sha1Base64", sha1.DigestBase64);
+                    command.Parameters.AddWithValue("$sha1", sha1Bytes);
+                    command.Parameters.AddWithValue("$sha1Hex", BitConverter.ToString(sha1Bytes).Replace("-", ""));
+                    command.Parameters.AddWithValue("$muUrl", (object)preferredUrl ?? DBNull.Value);
+                    command.Parameters.AddWithValue("$fileName", (object)file.FileName ?? DBNull.Value);
+                    command.Parameters.AddWithValue("$fileJson", _FileLocationFileJsonIsRequired ? (object)fileJson : DBNull.Value);
+                    command.Parameters.AddWithValue("$fileBlob", fileBlob);
+                    command.Parameters.AddWithValue("$fileCompression", CompressionBrotli);
+                    command.Parameters.AddWithValue("$packageIndex", packageIndex);
+                    command.ExecuteNonQuery();
+                }
+
+                using (var mapCommand = Connection.CreateCommand())
+                {
+                    mapCommand.Transaction = transaction;
+                    mapCommand.CommandText = @"
+INSERT OR IGNORE INTO package_file_map(package_index, sha1_base64)
+VALUES ($packageIndex, $sha1Base64);";
+                    mapCommand.Parameters.AddWithValue("$packageIndex", packageIndex);
+                    mapCommand.Parameters.AddWithValue("$sha1Base64", sha1.DigestBase64);
+                    mapCommand.ExecuteNonQuery();
+                }
             }
         }
 
@@ -769,6 +1031,377 @@ ON CONFLICT(sha1_base64) DO UPDATE SET
                 ?? file.Urls?
                     .FirstOrDefault(u => !string.IsNullOrEmpty(u.UssUrl))?
                     .UssUrl;
+        }
+
+        public static void OptimizeExisting(string path, bool replaceDatabaseFile, bool rebuildIndexes, Action<string> log = null)
+        {
+            if (!Exists(path))
+            {
+                throw new FileNotFoundException("The SQLite metadata store does not exist", Path.Combine(path, DatabaseFileName));
+            }
+
+            using (var store = new SQLitePackageStore(path, FileMode.Open, false))
+            {
+                store.OptimizeRows(rebuildIndexes, log);
+            }
+
+            if (replaceDatabaseFile)
+            {
+                VacuumIntoAndReplace(path, log);
+            }
+        }
+
+        private void OptimizeRows(bool rebuildIndexes, Action<string> log)
+        {
+            StateLock.EnterWriteLock();
+            try
+            {
+                log?.Invoke("Compressing package XML metadata stored in SQLite...");
+                var compressedMetadataRows = CompressUncompressedPackageMetadata(log);
+
+                log?.Invoke("Compressing package file metadata stored in SQLite...");
+                var compressedPackageFileRows = CompressPackageFiles(log);
+
+                log?.Invoke("Rebuilding compact SHA1 -> Microsoft URL lookup table...");
+                var rebuiltFileLocationRows = RebuildFileLocationsTableCompressed(log);
+
+                if (rebuildIndexes)
+                {
+                    log?.Invoke("Rebuilding indexes without embedding the full file-location payload...");
+                    CheckIndex(true);
+                    WriteIndexes();
+                    IsDirty = false;
+                    IsIndexDirty = false;
+                }
+
+                WriteProperty("schema_version", SchemaVersion.ToString());
+                WriteProperty("metadata_compression", CompressionBrotli);
+                WriteProperty("files_compression", CompressionBrotli);
+                WriteProperty("file_locations_compression", CompressionBrotli);
+
+                ExecuteNonQuery("PRAGMA optimize;");
+                ExecuteNonQuery("PRAGMA wal_checkpoint(TRUNCATE);");
+
+                log?.Invoke($"SQLite store optimization done. Compressed metadata rows: {compressedMetadataRows}; package file rows: {compressedPackageFileRows}; file-location rows: {rebuiltFileLocationRows}.");
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        private int CompressUncompressedPackageMetadata(Action<string> log)
+        {
+            var total = 0;
+
+            while (true)
+            {
+                var rows = new List<(int PackageIndex, byte[] Metadata)>();
+
+                using (var select = Connection.CreateCommand())
+                {
+                    select.CommandText = @"
+SELECT package_index, metadata
+FROM packages
+WHERE COALESCE(metadata_compression, 'none') = 'none'
+LIMIT $limit;";
+                    select.Parameters.AddWithValue("$limit", OptimizeBatchSize);
+
+                    using var reader = select.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        rows.Add((reader.GetInt32(0), (byte[])reader[1]));
+                    }
+                }
+
+                if (rows.Count == 0)
+                {
+                    break;
+                }
+
+                using var transaction = Connection.BeginTransaction();
+                using var update = Connection.CreateCommand();
+                update.Transaction = transaction;
+                update.CommandText = @"
+UPDATE packages
+SET metadata = $metadata,
+    metadata_compression = $metadataCompression
+WHERE package_index = $packageIndex;";
+                var packageIndexParameter = update.CreateParameter();
+                packageIndexParameter.ParameterName = "$packageIndex";
+                update.Parameters.Add(packageIndexParameter);
+
+                var metadataParameter = update.CreateParameter();
+                metadataParameter.ParameterName = "$metadata";
+                update.Parameters.Add(metadataParameter);
+
+                var compressionParameter = update.CreateParameter();
+                compressionParameter.ParameterName = "$metadataCompression";
+                compressionParameter.Value = CompressionBrotli;
+                update.Parameters.Add(compressionParameter);
+
+                foreach (var row in rows)
+                {
+                    packageIndexParameter.Value = row.PackageIndex;
+                    metadataParameter.Value = CompressBytes(row.Metadata);
+                    update.ExecuteNonQuery();
+                    total++;
+                }
+
+                transaction.Commit();
+                log?.Invoke($"Compressed package XML metadata rows: {total}");
+            }
+
+            return total;
+        }
+
+        private int CompressPackageFiles(Action<string> log)
+        {
+            var total = 0;
+
+            while (true)
+            {
+                var rows = new List<(int PackageIndex, string FilesJson)>();
+
+                using (var select = Connection.CreateCommand())
+                {
+                    select.CommandText = @"
+SELECT package_index, files_json
+FROM packages
+WHERE files_json IS NOT NULL
+LIMIT $limit;";
+                    select.Parameters.AddWithValue("$limit", OptimizeBatchSize);
+
+                    using var reader = select.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        rows.Add((reader.GetInt32(0), reader.GetString(1)));
+                    }
+                }
+
+                if (rows.Count == 0)
+                {
+                    break;
+                }
+
+                using var transaction = Connection.BeginTransaction();
+                using var update = Connection.CreateCommand();
+                update.Transaction = transaction;
+                update.CommandText = @"
+UPDATE packages
+SET files_blob = $filesBlob,
+    files_compression = $filesCompression,
+    files_json = NULL
+WHERE package_index = $packageIndex;";
+                var packageIndexParameter = update.CreateParameter();
+                packageIndexParameter.ParameterName = "$packageIndex";
+                update.Parameters.Add(packageIndexParameter);
+
+                var filesBlobParameter = update.CreateParameter();
+                filesBlobParameter.ParameterName = "$filesBlob";
+                update.Parameters.Add(filesBlobParameter);
+
+                var compressionParameter = update.CreateParameter();
+                compressionParameter.ParameterName = "$filesCompression";
+                compressionParameter.Value = CompressionBrotli;
+                update.Parameters.Add(compressionParameter);
+
+                foreach (var row in rows)
+                {
+                    packageIndexParameter.Value = row.PackageIndex;
+                    filesBlobParameter.Value = CompressString(row.FilesJson);
+                    update.ExecuteNonQuery();
+                    total++;
+                }
+
+                transaction.Commit();
+                log?.Invoke($"Compressed package file-metadata rows: {total}");
+            }
+
+            return total;
+        }
+
+        private int RebuildFileLocationsTableCompressed(Action<string> log)
+        {
+            ExecuteNonQuery("PRAGMA foreign_keys=OFF;");
+            ExecuteNonQuery("DROP TABLE IF EXISTS file_locations_compact;");
+            ExecuteNonQuery(@"
+CREATE TABLE file_locations_compact (
+    sha1_base64 TEXT PRIMARY KEY,
+    sha1 BLOB NOT NULL,
+    sha1_hex TEXT NOT NULL,
+    mu_url TEXT NULL,
+    file_name TEXT NULL,
+    file_json TEXT NULL,
+    file_blob BLOB NULL,
+    file_compression TEXT NULL,
+    package_index INTEGER NOT NULL,
+    FOREIGN KEY(package_index) REFERENCES packages(package_index) ON DELETE CASCADE
+); ");
+
+            var total = 0;
+            string lastSha1Base64 = null;
+
+            while (true)
+            {
+                var rows = new List<FileLocationCompactRow>();
+
+                using (var select = Connection.CreateCommand())
+                {
+                    select.CommandText = @"
+SELECT sha1_base64, sha1, sha1_hex, mu_url, file_name, file_blob, file_compression, file_json, package_index
+FROM file_locations
+WHERE $lastSha1Base64 IS NULL OR sha1_base64 > $lastSha1Base64
+ORDER BY sha1_base64
+LIMIT $limit;";
+                    select.Parameters.AddWithValue("$lastSha1Base64", (object)lastSha1Base64 ?? DBNull.Value);
+                    select.Parameters.AddWithValue("$limit", OptimizeBatchSize);
+
+                    using var reader = select.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        rows.Add(new FileLocationCompactRow
+                        {
+                            Sha1Base64 = reader.GetString(0),
+                            Sha1 = (byte[])reader[1],
+                            Sha1Hex = reader.GetString(2),
+                            MuUrl = reader.IsDBNull(3) ? null : reader.GetString(3),
+                            FileName = reader.IsDBNull(4) ? null : reader.GetString(4),
+                            FileBlob = reader.IsDBNull(5) ? null : (byte[])reader[5],
+                            FileCompression = reader.IsDBNull(6) ? null : reader.GetString(6),
+                            FileJson = reader.IsDBNull(7) ? null : reader.GetString(7),
+                            PackageIndex = reader.GetInt32(8)
+                        });
+                    }
+                }
+
+                if (rows.Count == 0)
+                {
+                    break;
+                }
+
+                using var transaction = Connection.BeginTransaction();
+                using var insert = Connection.CreateCommand();
+                insert.Transaction = transaction;
+                insert.CommandText = @"
+INSERT INTO file_locations_compact(sha1_base64, sha1, sha1_hex, mu_url, file_name, file_json, file_blob, file_compression, package_index)
+VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, $fileBlob, $fileCompression, $packageIndex);";
+
+                var sha1Base64Parameter = insert.CreateParameter();
+                sha1Base64Parameter.ParameterName = "$sha1Base64";
+                insert.Parameters.Add(sha1Base64Parameter);
+
+                var sha1Parameter = insert.CreateParameter();
+                sha1Parameter.ParameterName = "$sha1";
+                insert.Parameters.Add(sha1Parameter);
+
+                var sha1HexParameter = insert.CreateParameter();
+                sha1HexParameter.ParameterName = "$sha1Hex";
+                insert.Parameters.Add(sha1HexParameter);
+
+                var muUrlParameter = insert.CreateParameter();
+                muUrlParameter.ParameterName = "$muUrl";
+                insert.Parameters.Add(muUrlParameter);
+
+                var fileNameParameter = insert.CreateParameter();
+                fileNameParameter.ParameterName = "$fileName";
+                insert.Parameters.Add(fileNameParameter);
+
+                var fileBlobParameter = insert.CreateParameter();
+                fileBlobParameter.ParameterName = "$fileBlob";
+                insert.Parameters.Add(fileBlobParameter);
+
+                var fileCompressionParameter = insert.CreateParameter();
+                fileCompressionParameter.ParameterName = "$fileCompression";
+                insert.Parameters.Add(fileCompressionParameter);
+
+                var packageIndexParameter = insert.CreateParameter();
+                packageIndexParameter.ParameterName = "$packageIndex";
+                insert.Parameters.Add(packageIndexParameter);
+
+                foreach (var row in rows)
+                {
+                    var fileBlob = row.FileBlob;
+                    var fileCompression = row.FileCompression;
+
+                    if (fileBlob == null && !string.IsNullOrEmpty(row.FileJson))
+                    {
+                        fileBlob = CompressString(row.FileJson);
+                        fileCompression = CompressionBrotli;
+                    }
+
+                    sha1Base64Parameter.Value = row.Sha1Base64;
+                    sha1Parameter.Value = row.Sha1;
+                    sha1HexParameter.Value = row.Sha1Hex;
+                    muUrlParameter.Value = (object)row.MuUrl ?? DBNull.Value;
+                    fileNameParameter.Value = (object)row.FileName ?? DBNull.Value;
+                    fileBlobParameter.Value = (object)fileBlob ?? DBNull.Value;
+                    fileCompressionParameter.Value = (object)fileCompression ?? DBNull.Value;
+                    packageIndexParameter.Value = row.PackageIndex;
+                    insert.ExecuteNonQuery();
+
+                    lastSha1Base64 = row.Sha1Base64;
+                    total++;
+                }
+
+                transaction.Commit();
+                log?.Invoke($"Compacted file-location rows: {total}");
+            }
+
+            ExecuteNonQuery("DROP TABLE file_locations;");
+            ExecuteNonQuery("ALTER TABLE file_locations_compact RENAME TO file_locations;");
+            ExecuteNonQuery("CREATE INDEX IF NOT EXISTS idx_file_locations_package ON file_locations(package_index);");
+            ExecuteNonQuery("PRAGMA foreign_keys=ON;");
+            _FileLocationFileJsonIsRequired = false;
+
+            return total;
+        }
+
+        private static void VacuumIntoAndReplace(string path, Action<string> log)
+        {
+            var databasePath = Path.Combine(path, DatabaseFileName);
+            var compactPath = Path.Combine(path, "metadata.compact.sqlite");
+
+            if (File.Exists(compactPath))
+            {
+                File.Delete(compactPath);
+            }
+
+            log?.Invoke("Creating compact SQLite database copy with VACUUM INTO...");
+            var connectionString = new SqliteConnectionStringBuilder
+            {
+                DataSource = databasePath,
+                Mode = SqliteOpenMode.ReadWriteCreate,
+                Cache = SqliteCacheMode.Shared
+            }.ToString();
+
+            using (var connection = new SqliteConnection(connectionString))
+            {
+                connection.Open();
+                using (var checkpoint = connection.CreateCommand())
+                {
+                    checkpoint.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
+                    checkpoint.ExecuteNonQuery();
+                }
+
+                using var vacuum = connection.CreateCommand();
+                vacuum.CommandText = "VACUUM INTO '" + compactPath.Replace("'", "''") + "';";
+                vacuum.ExecuteNonQuery();
+            }
+
+            var backupPath = Path.Combine(path, "metadata.sqlite.before-compact-" + DateTime.UtcNow.ToString("yyyyMMddHHmmss"));
+            File.Move(databasePath, backupPath);
+
+            foreach (var sidecar in new[] { databasePath + "-wal", databasePath + "-shm" })
+            {
+                if (File.Exists(sidecar))
+                {
+                    File.Delete(sidecar);
+                }
+            }
+
+            File.Move(compactPath, databasePath);
+            log?.Invoke($"Compacted database installed. Previous database kept as: {backupPath}");
         }
 
         public void Flush()
@@ -937,6 +1570,13 @@ ON CONFLICT(sha1_base64) DO UPDATE SET
                     throw new KeyNotFoundException();
                 }
 
+                if (string.Equals(indexName, AvailableIndexes.FilesIndexName, StringComparison.Ordinal) &&
+                    typeof(T) == typeof(UpdateFile))
+                {
+                    value = GetFiles<UpdateFile>(packageIdentity).Cast<T>().ToList();
+                    return value.Count > 0;
+                }
+
                 return Indexes.TryListKeyLookup(packageIndex, indexName, out value);
             }
             finally
@@ -1038,6 +1678,19 @@ ON CONFLICT(sha1_base64) DO UPDATE SET
                 StateLock.ExitWriteLock();
                 StateLock.Dispose();
             }
+        }
+
+        private sealed class FileLocationCompactRow
+        {
+            public string Sha1Base64 { get; set; }
+            public byte[] Sha1 { get; set; }
+            public string Sha1Hex { get; set; }
+            public string MuUrl { get; set; }
+            public string FileName { get; set; }
+            public byte[] FileBlob { get; set; }
+            public string FileCompression { get; set; }
+            public string FileJson { get; set; }
+            public int PackageIndex { get; set; }
         }
 
         private sealed class StagedPackage

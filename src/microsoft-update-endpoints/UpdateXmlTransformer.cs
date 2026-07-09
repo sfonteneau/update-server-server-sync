@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Xml.Linq;
 using System.Xml.XPath;
@@ -160,22 +161,25 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
             XDocument xml = XDocument.Parse(metadataXml);
             StripNamespacesFromXml(xml);
 
-            var localizedProperties = xml.Root.XPathSelectElements("/Update/LocalizedPropertiesCollection/LocalizedProperties");
+            var requestedLanguages = new HashSet<string>(languages ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+            var localizedProperties = xml.Root.XPathSelectElements("/Update/LocalizedPropertiesCollection/LocalizedProperties").ToList();
 
-            foreach(var localizedProperty in localizedProperties)
+            foreach (var localizedProperty in localizedProperties)
             {
                 var languageElement = localizedProperty.XPathSelectElement("Language");
-                if (languageElement != null && languages.Contains(languageElement.Value))
+                if (languageElement != null && requestedLanguages.Contains(languageElement.Value))
                 {
                     return localizedProperty.ToString(SaveOptions.DisableFormatting);
                 }
-                else
-                {
-                    continue;
-                }
             }
 
-            return null;
+            // When the local store is intentionally reduced to English-only metadata, still provide
+            // a valid LocalizedProperties fragment instead of returning nothing to a non-English client.
+            var englishFallback = localizedProperties.FirstOrDefault(localizedProperty =>
+                string.Equals(localizedProperty.XPathSelectElement("Language")?.Value, "en", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(localizedProperty.XPathSelectElement("Language")?.Value, "en-us", StringComparison.OrdinalIgnoreCase));
+
+            return englishFallback?.ToString(SaveOptions.DisableFormatting);
         }
     }
 }

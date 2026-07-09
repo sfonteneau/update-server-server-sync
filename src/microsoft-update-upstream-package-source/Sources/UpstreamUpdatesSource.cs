@@ -116,7 +116,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
                         return;
                     }
 
-                    var retrievedPackages = _Client.GetUpdateDataForIds(batch.ToList());
+                    var retrievedPackages = _Client.GetUpdateDataForIds(batch.ToList(), _Filter);
                     destination.AddPackages(retrievedPackages);
                     retrievedPackages.ForEach(u => u.ReleaseMetadataBytes());
 
