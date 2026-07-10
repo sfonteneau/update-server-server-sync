@@ -46,6 +46,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// Progress indicator during source open operations. Not used by UpstreamUpdatesSource.
         /// </summary>
         public event EventHandler<PackageStoreEventArgs> OpenProgress;
+#pragma warning restore 0067
 
         /// <summary>
         /// Create a new MicrosoftUpdate package source that retrieves updates from the specified endpoint
@@ -87,6 +88,16 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         }
 
         /// <summary>
+        /// Retrieves and caches the complete revision identity list returned by
+        /// GetRevisionIdList for this source and anchor.
+        /// </summary>
+        public IReadOnlyList<MicrosoftUpdatePackageIdentity> GetPackageIdentities()
+        {
+            RetrievePackageIdentities();
+            return _Identities.ToList();
+        }
+
+        /// <summary>
         /// Breaks down a flat list of objects in a list of batches, each batch having a maximum allowed size
         /// </summary>
         /// <typeparam name="T">The type of objects to batch</typeparam>
@@ -97,45 +108,65 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         {
             maxBatchSize = Math.Max(1, maxBatchSize);
 
-            // Figure out how many batches we have
             var batchCount = flatList.Count / maxBatchSize;
-            // One more batch for the remaining objects, if any
             batchCount += flatList.Count % maxBatchSize == 0 ? 0 : 1;
 
             List<List<T>> batches = new(batchCount);
             for (int i = 0; i < batchCount; i++)
             {
                 var batchSize = maxBatchSize;
-                // If this is the last batch, the size might not be the max allowed size but the remainder of elements
                 if (i == batchCount - 1 && flatList.Count % maxBatchSize != 0)
                 {
                     batchSize = flatList.Count % maxBatchSize;
                 }
 
-                // Add the new batch to the batches list
                 batches.Add(flatList.GetRange(i * maxBatchSize, batchSize));
             }
 
             return batches;
         }
 
-        /// <inheritdoc cref="IMetadataSource.CopyTo(IMetadataSink, CancellationToken)"/>
-        public void CopyTo(IMetadataSink destination, CancellationToken cancelToken)
+        /// <summary>
+        /// Retrieves and stores only the supplied revision identities. The callback
+        /// is invoked after each local batch has been committed to the destination.
+        /// This allows callers to checkpoint progress without advancing the WSUS anchor.
+        /// </summary>
+        public void CopyPackagesTo(
+            IMetadataSink destination,
+            IEnumerable<MicrosoftUpdatePackageIdentity> packageIdentities,
+            CancellationToken cancelToken,
+            Action<IReadOnlyList<MicrosoftUpdatePackageIdentity>> batchStored = null)
         {
-            RetrievePackageIdentities();
-
-            List<MicrosoftUpdatePackageIdentity> unavailableUpdates;
-
-            if (destination is IMetadataStore destinationBaseline)
+            if (destination == null)
             {
-                 unavailableUpdates = _Identities.Where(u => !destinationBaseline.ContainsPackage(u)).ToList();
-            }
-            else
-            {
-                unavailableUpdates = _Identities;
+                throw new ArgumentNullException(nameof(destination));
             }
 
-            var progressArgs = new PackageStoreEventArgs() { Total = unavailableUpdates.Count, Current = 0 };
+            var requestedUpdates = (packageIdentities ?? Array.Empty<MicrosoftUpdatePackageIdentity>())
+                .Where(identity => identity != null)
+                .Distinct()
+                .ToList();
+
+            var destinationBaseline = destination as IMetadataStore;
+            var alreadyAvailable = destinationBaseline == null
+                ? new List<MicrosoftUpdatePackageIdentity>()
+                : requestedUpdates.Where(destinationBaseline.ContainsPackage).ToList();
+
+            if (alreadyAvailable.Count > 0)
+            {
+                batchStored?.Invoke(alreadyAvailable);
+            }
+
+            var alreadyAvailableSet = new HashSet<MicrosoftUpdatePackageIdentity>(alreadyAvailable);
+            var unavailableUpdates = requestedUpdates
+                .Where(identity => !alreadyAvailableSet.Contains(identity))
+                .ToList();
+
+            var progressArgs = new PackageStoreEventArgs
+            {
+                Total = requestedUpdates.Count,
+                Current = alreadyAvailable.Count
+            };
             MetadataCopyProgress?.Invoke(this, progressArgs);
 
             if (unavailableUpdates.Count == 0)
@@ -149,18 +180,63 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
             // in-memory indexes; firing many concurrent AddPackages calls mostly creates lock contention.
             foreach (var batch in batches)
             {
-                if (cancelToken.IsCancellationRequested)
+                cancelToken.ThrowIfCancellationRequested();
+
+                var retrievedPackages = _Client.GetUpdateDataForIds(batch, _Filter);
+                try
                 {
-                    return;
+                    destination.AddPackages(retrievedPackages);
+
+                    List<MicrosoftUpdatePackageIdentity> completedBatch;
+                    if (destinationBaseline != null)
+                    {
+                        completedBatch = batch
+                            .Where(destinationBaseline.ContainsPackage)
+                            .ToList();
+                    }
+                    else
+                    {
+                        var batchSet = new HashSet<MicrosoftUpdatePackageIdentity>(batch);
+                        completedBatch = retrievedPackages
+                            .Select(package => package.Id)
+                            .OfType<MicrosoftUpdatePackageIdentity>()
+                            .Where(batchSet.Contains)
+                            .Distinct()
+                            .ToList();
+                    }
+
+                    if (completedBatch.Count > 0)
+                    {
+                        batchStored?.Invoke(completedBatch);
+                    }
+
+                    progressArgs.Current += completedBatch.Count;
+                    MetadataCopyProgress?.Invoke(this, progressArgs);
+
+                    var completedSet = new HashSet<MicrosoftUpdatePackageIdentity>(completedBatch);
+                    var missingUpdates = batch
+                        .Where(identity => !completedSet.Contains(identity))
+                        .ToList();
+
+                    if (missingUpdates.Count > 0)
+                    {
+                        var sample = string.Join(", ", missingUpdates.Take(10));
+                        throw new InvalidDataException(
+                            $"The upstream server did not return metadata for {missingUpdates.Count} requested revision(s). " +
+                            $"The synchronization anchor was not advanced. Missing sample: {sample}");
+                    }
                 }
-
-                var retrievedPackages = _Client.GetUpdateDataForIds(batch.ToList(), _Filter);
-                destination.AddPackages(retrievedPackages);
-                retrievedPackages.ForEach(u => u.ReleaseMetadataBytes());
-
-                progressArgs.Current += retrievedPackages.Count;
-                MetadataCopyProgress?.Invoke(this, progressArgs);
+                finally
+                {
+                    retrievedPackages.ForEach(package => package.ReleaseMetadataBytes());
+                }
             }
+        }
+
+        /// <inheritdoc cref="IMetadataSource.CopyTo(IMetadataSink, CancellationToken)"/>
+        public void CopyTo(IMetadataSink destination, CancellationToken cancelToken)
+        {
+            CopyPackagesTo(destination, GetPackageIdentities(), cancelToken);
         }
 
         /// <inheritdoc cref="IMetadataSource.CopyTo(IMetadataSink, IMetadataFilter, CancellationToken)"/>

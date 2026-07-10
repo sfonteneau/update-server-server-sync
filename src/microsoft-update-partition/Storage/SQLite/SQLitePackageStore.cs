@@ -16,6 +16,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
+using System.Globalization;
 using System.Linq;
 using System.Text;
 using System.Threading;
@@ -31,11 +32,11 @@ namespace Microsoft.PackageGraph.Storage.Local
     /// delta archives named 0.zip, 1.zip, ... . Metadata, file metadata and the
     /// serialized index container now live in store/metadata.sqlite.
     /// </summary>
-    class SQLitePackageStore : IMetadataSink, IMetadataStore, IMetadataLookup, IMicrosoftUpdateFileLocationLookup, ISyncAnchorStore
+    class SQLitePackageStore : IMetadataSink, IMetadataStore, IMetadataLookup, IMicrosoftUpdateFileLocationLookup, ISyncAnchorStore, ISyncCheckpointStore
     {
         public const string DatabaseFileName = "metadata.sqlite";
 
-        private const int SchemaVersion = 2;
+        private const int SchemaVersion = 3;
         private const string IndexBlobKey = "indexes.zip";
         private const string CompressionNone = "none";
         private const string CompressionBrotli = "br";
@@ -208,6 +209,33 @@ CREATE TABLE IF NOT EXISTS package_file_map (
 
 CREATE INDEX IF NOT EXISTS idx_package_file_map_sha1
 ON package_file_map(sha1_base64);
+
+CREATE TABLE IF NOT EXISTS sync_checkpoints (
+    checkpoint_id INTEGER PRIMARY KEY,
+    anchor_key TEXT NOT NULL UNIQUE,
+    anchor_from TEXT NULL,
+    anchor_to TEXT NOT NULL,
+    total_items INTEGER NOT NULL DEFAULT 0,
+    completed_items INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sync_checkpoint_items (
+    checkpoint_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    identity TEXT NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT NULL,
+    completed_at TEXT NULL,
+    last_error TEXT NULL,
+    PRIMARY KEY(checkpoint_id, identity),
+    FOREIGN KEY(checkpoint_id) REFERENCES sync_checkpoints(checkpoint_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_sync_checkpoint_items_pending
+ON sync_checkpoint_items(checkpoint_id, completed, ordinal);
 ");
 
             using var command = Connection.CreateCommand();
@@ -226,8 +254,23 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
             EnsureColumnExists("packages", "files_compression", "TEXT NULL");
             EnsureColumnExists("file_locations", "file_blob", "BLOB NULL");
             EnsureColumnExists("file_locations", "file_compression", "TEXT NULL");
+            EnsureColumnExists("sync_checkpoints", "total_items", "INTEGER NOT NULL DEFAULT 0");
+            EnsureColumnExists("sync_checkpoints", "completed_items", "INTEGER NOT NULL DEFAULT 0");
 
             ExecuteNonQuery(@"
+UPDATE sync_checkpoints
+SET total_items = (
+        SELECT COUNT(*)
+        FROM sync_checkpoint_items
+        WHERE sync_checkpoint_items.checkpoint_id = sync_checkpoints.checkpoint_id
+    ),
+    completed_items = (
+        SELECT COUNT(*)
+        FROM sync_checkpoint_items
+        WHERE sync_checkpoint_items.checkpoint_id = sync_checkpoints.checkpoint_id
+          AND sync_checkpoint_items.completed = 1
+    );
+
 INSERT OR IGNORE INTO package_file_map(package_index, sha1_base64)
 SELECT package_index, sha1_base64
 FROM file_locations
@@ -507,6 +550,588 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
             {
                 StateLock.ExitWriteLock();
             }
+        }
+
+        public bool TryGetSyncCheckpoint(string anchorKey, out SyncCheckpointInfo checkpoint)
+        {
+            checkpoint = null;
+            if (string.IsNullOrWhiteSpace(anchorKey))
+            {
+                return false;
+            }
+
+            StateLock.EnterReadLock();
+            try
+            {
+                using var command = Connection.CreateCommand();
+                command.CommandText = @"
+SELECT
+    anchor_from,
+    anchor_to,
+    total_items,
+    completed_items,
+    created_at,
+    updated_at
+FROM sync_checkpoints
+WHERE anchor_key = $anchorKey;";
+                command.Parameters.AddWithValue("$anchorKey", anchorKey);
+
+                using var reader = command.ExecuteReader();
+                if (!reader.Read())
+                {
+                    return false;
+                }
+
+                checkpoint = new SyncCheckpointInfo(
+                    anchorKey,
+                    reader.IsDBNull(0) ? null : reader.GetString(0),
+                    reader.GetString(1),
+                    checked((int)reader.GetInt64(2)),
+                    checked((int)reader.GetInt64(3)),
+                    ParseCheckpointTimestamp(reader.GetString(4)),
+                    ParseCheckpointTimestamp(reader.GetString(5)));
+                return true;
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        public void CreateSyncCheckpoint(
+            string anchorKey,
+            string anchorFrom,
+            string anchorTo,
+            IReadOnlyList<IPackageIdentity> packageIdentities)
+        {
+            if (string.IsNullOrWhiteSpace(anchorKey))
+            {
+                throw new ArgumentException("A checkpoint anchor key is required", nameof(anchorKey));
+            }
+
+            if (string.IsNullOrWhiteSpace(anchorTo))
+            {
+                throw new ArgumentException("The upstream checkpoint anchor is required", nameof(anchorTo));
+            }
+
+            var requestedIdentities = (packageIdentities ?? Array.Empty<IPackageIdentity>())
+                .Where(identity => identity != null)
+                .Distinct()
+                .ToList();
+            var now = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
+
+            StateLock.EnterWriteLock();
+            try
+            {
+                // Existing package rows are already durable and do not need a
+                // temporary checkpoint item. This keeps forced full queries on a
+                // populated store from duplicating the whole identity list.
+                var identities = requestedIdentities
+                    .Where(identity => !_IdentityToIndexMap.ContainsKey(identity))
+                    .ToList();
+
+                using var transaction = Connection.BeginTransaction();
+
+                using (var existenceCommand = Connection.CreateCommand())
+                {
+                    existenceCommand.Transaction = transaction;
+                    existenceCommand.CommandText =
+                        "SELECT COUNT(*) FROM sync_checkpoints WHERE anchor_key = $anchorKey;";
+                    existenceCommand.Parameters.AddWithValue("$anchorKey", anchorKey);
+                    if ((long)existenceCommand.ExecuteScalar() != 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"An unfinished synchronization checkpoint already exists for {anchorKey}");
+                    }
+                }
+
+                using (var checkpointCommand = Connection.CreateCommand())
+                {
+                    checkpointCommand.Transaction = transaction;
+                    checkpointCommand.CommandText = @"
+INSERT INTO sync_checkpoints(
+    anchor_key,
+    anchor_from,
+    anchor_to,
+    total_items,
+    completed_items,
+    created_at,
+    updated_at)
+VALUES ($anchorKey, $anchorFrom, $anchorTo, $totalItems, 0, $createdAt, $updatedAt);";
+                    checkpointCommand.Parameters.AddWithValue("$anchorKey", anchorKey);
+                    checkpointCommand.Parameters.AddWithValue("$anchorFrom", (object)anchorFrom ?? DBNull.Value);
+                    checkpointCommand.Parameters.AddWithValue("$anchorTo", anchorTo);
+                    checkpointCommand.Parameters.AddWithValue("$totalItems", identities.Count);
+                    checkpointCommand.Parameters.AddWithValue("$createdAt", now);
+                    checkpointCommand.Parameters.AddWithValue("$updatedAt", now);
+                    checkpointCommand.ExecuteNonQuery();
+                }
+
+                long checkpointId;
+                using (var idCommand = Connection.CreateCommand())
+                {
+                    idCommand.Transaction = transaction;
+                    idCommand.CommandText =
+                        "SELECT checkpoint_id FROM sync_checkpoints WHERE anchor_key = $anchorKey;";
+                    idCommand.Parameters.AddWithValue("$anchorKey", anchorKey);
+                    checkpointId = (long)idCommand.ExecuteScalar();
+                }
+
+                using (var itemCommand = Connection.CreateCommand())
+                {
+                    itemCommand.Transaction = transaction;
+                    itemCommand.CommandText = @"
+INSERT INTO sync_checkpoint_items(checkpoint_id, ordinal, identity)
+VALUES ($checkpointId, $ordinal, $identity);";
+                    var checkpointIdParameter = itemCommand.Parameters.Add("$checkpointId", SqliteType.Integer);
+                    var ordinalParameter = itemCommand.Parameters.Add("$ordinal", SqliteType.Integer);
+                    var identityParameter = itemCommand.Parameters.Add("$identity", SqliteType.Text);
+                    itemCommand.Prepare();
+
+                    checkpointIdParameter.Value = checkpointId;
+                    for (var index = 0; index < identities.Count; index++)
+                    {
+                        ordinalParameter.Value = index;
+                        identityParameter.Value = identities[index].ToString();
+                        itemCommand.ExecuteNonQuery();
+                    }
+                }
+
+                transaction.Commit();
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public IReadOnlyList<IPackageIdentity> GetPendingSyncCheckpointItems(string anchorKey, int maxCount)
+        {
+            if (string.IsNullOrWhiteSpace(anchorKey) || maxCount <= 0)
+            {
+                return Array.Empty<IPackageIdentity>();
+            }
+
+            StateLock.EnterReadLock();
+            try
+            {
+                var identities = new List<IPackageIdentity>(maxCount);
+                using var command = Connection.CreateCommand();
+                command.CommandText = @"
+SELECT item.identity
+FROM sync_checkpoint_items AS item
+JOIN sync_checkpoints AS checkpoint
+  ON checkpoint.checkpoint_id = item.checkpoint_id
+WHERE checkpoint.anchor_key = $anchorKey
+  AND item.completed = 0
+ORDER BY item.ordinal
+LIMIT $maxCount;";
+                command.Parameters.AddWithValue("$anchorKey", anchorKey);
+                command.Parameters.AddWithValue("$maxCount", maxCount);
+
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    identities.Add(IdentityFromString(reader.GetString(0)));
+                }
+
+                return identities;
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        public void MarkSyncCheckpointItemsAttempted(
+            string anchorKey,
+            IEnumerable<IPackageIdentity> packageIdentities)
+        {
+            var identityStrings = NormalizeCheckpointIdentityStrings(packageIdentities);
+            if (string.IsNullOrWhiteSpace(anchorKey) || identityStrings.Count == 0)
+            {
+                return;
+            }
+
+            var now = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var transaction = Connection.BeginTransaction();
+                using var command = Connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = @"
+UPDATE sync_checkpoint_items
+SET attempt_count = attempt_count + 1,
+    last_attempt_at = $now,
+    last_error = NULL
+WHERE checkpoint_id = (
+        SELECT checkpoint_id
+        FROM sync_checkpoints
+        WHERE anchor_key = $anchorKey
+    )
+  AND identity = $identity
+  AND completed = 0;";
+                var anchorKeyParameter = command.Parameters.Add("$anchorKey", SqliteType.Text);
+                var identityParameter = command.Parameters.Add("$identity", SqliteType.Text);
+                var nowParameter = command.Parameters.Add("$now", SqliteType.Text);
+                command.Prepare();
+
+                anchorKeyParameter.Value = anchorKey;
+                nowParameter.Value = now;
+                foreach (var identity in identityStrings)
+                {
+                    identityParameter.Value = identity;
+                    command.ExecuteNonQuery();
+                }
+
+                UpdateCheckpointTimestamp(anchorKey, now, transaction);
+                transaction.Commit();
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public void MarkSyncCheckpointItemsCompleted(
+            string anchorKey,
+            IEnumerable<IPackageIdentity> packageIdentities)
+        {
+            var identityStrings = NormalizeCheckpointIdentityStrings(packageIdentities);
+            if (string.IsNullOrWhiteSpace(anchorKey) || identityStrings.Count == 0)
+            {
+                return;
+            }
+
+            var now = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var transaction = Connection.BeginTransaction();
+                using var command = Connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = @"
+UPDATE sync_checkpoint_items
+SET completed = 1,
+    completed_at = COALESCE(completed_at, $now),
+    last_error = NULL
+WHERE checkpoint_id = (
+        SELECT checkpoint_id
+        FROM sync_checkpoints
+        WHERE anchor_key = $anchorKey
+    )
+  AND identity = $identity
+  AND completed = 0;";
+                var anchorKeyParameter = command.Parameters.Add("$anchorKey", SqliteType.Text);
+                var identityParameter = command.Parameters.Add("$identity", SqliteType.Text);
+                var nowParameter = command.Parameters.Add("$now", SqliteType.Text);
+                command.Prepare();
+
+                anchorKeyParameter.Value = anchorKey;
+                nowParameter.Value = now;
+                var completedDelta = 0;
+                foreach (var identity in identityStrings)
+                {
+                    identityParameter.Value = identity;
+                    completedDelta += command.ExecuteNonQuery();
+                }
+
+                UpdateCheckpointProgress(anchorKey, completedDelta, now, transaction);
+                transaction.Commit();
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public void MarkSyncCheckpointItemsFailed(
+            string anchorKey,
+            IEnumerable<IPackageIdentity> packageIdentities,
+            string error)
+        {
+            var identityStrings = NormalizeCheckpointIdentityStrings(packageIdentities);
+            if (string.IsNullOrWhiteSpace(anchorKey) || identityStrings.Count == 0)
+            {
+                return;
+            }
+
+            var now = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
+            var safeError = string.IsNullOrWhiteSpace(error)
+                ? "Metadata retrieval failed"
+                : error.Length <= 4000 ? error : error.Substring(0, 4000);
+
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var transaction = Connection.BeginTransaction();
+                using var command = Connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = @"
+UPDATE sync_checkpoint_items
+SET last_attempt_at = COALESCE(last_attempt_at, $now),
+    last_error = $error
+WHERE checkpoint_id = (
+        SELECT checkpoint_id
+        FROM sync_checkpoints
+        WHERE anchor_key = $anchorKey
+    )
+  AND identity = $identity
+  AND completed = 0;";
+                var anchorKeyParameter = command.Parameters.Add("$anchorKey", SqliteType.Text);
+                var identityParameter = command.Parameters.Add("$identity", SqliteType.Text);
+                var nowParameter = command.Parameters.Add("$now", SqliteType.Text);
+                var errorParameter = command.Parameters.Add("$error", SqliteType.Text);
+                command.Prepare();
+
+                anchorKeyParameter.Value = anchorKey;
+                nowParameter.Value = now;
+                errorParameter.Value = safeError;
+                foreach (var identity in identityStrings)
+                {
+                    identityParameter.Value = identity;
+                    command.ExecuteNonQuery();
+                }
+
+                UpdateCheckpointTimestamp(anchorKey, now, transaction);
+                transaction.Commit();
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public void ReconcileSyncCheckpoint(string anchorKey)
+        {
+            if (string.IsNullOrWhiteSpace(anchorKey))
+            {
+                return;
+            }
+
+            var now = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var transaction = Connection.BeginTransaction();
+                using var command = Connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = @"
+UPDATE sync_checkpoint_items
+SET completed = 1,
+    completed_at = COALESCE(completed_at, $now),
+    last_error = NULL
+WHERE checkpoint_id = (
+        SELECT checkpoint_id
+        FROM sync_checkpoints
+        WHERE anchor_key = $anchorKey
+    )
+  AND completed = 0
+  AND EXISTS (
+      SELECT 1
+      FROM packages
+      WHERE packages.identity = sync_checkpoint_items.identity
+  );";
+                command.Parameters.AddWithValue("$anchorKey", anchorKey);
+                command.Parameters.AddWithValue("$now", now);
+                var completedDelta = command.ExecuteNonQuery();
+                UpdateCheckpointProgress(anchorKey, completedDelta, now, transaction);
+                transaction.Commit();
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public void CompleteSyncCheckpoint(string anchorKey)
+        {
+            if (string.IsNullOrWhiteSpace(anchorKey))
+            {
+                throw new ArgumentException("A checkpoint anchor key is required", nameof(anchorKey));
+            }
+
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var transaction = Connection.BeginTransaction();
+                string anchorTo;
+
+                using (var anchorCommand = Connection.CreateCommand())
+                {
+                    anchorCommand.Transaction = transaction;
+                    anchorCommand.CommandText = @"
+SELECT anchor_to, total_items, completed_items
+FROM sync_checkpoints
+WHERE anchor_key = $anchorKey;";
+                    anchorCommand.Parameters.AddWithValue("$anchorKey", anchorKey);
+                    using var reader = anchorCommand.ExecuteReader();
+                    if (!reader.Read())
+                    {
+                        throw new InvalidOperationException(
+                            $"No synchronization checkpoint exists for {anchorKey}");
+                    }
+
+                    anchorTo = reader.GetString(0);
+                    var totalItems = reader.GetInt64(1);
+                    var completedItems = reader.GetInt64(2);
+                    if (completedItems != totalItems)
+                    {
+                        throw new InvalidOperationException(
+                            $"Cannot promote the synchronization anchor while " +
+                            $"{totalItems - completedItems} checkpoint item(s) are pending");
+                    }
+                }
+
+                // Verify the counter once at completion. Normal progress reads are
+                // O(1); this final indexed count protects against manual database edits.
+                using (var pendingCommand = Connection.CreateCommand())
+                {
+                    pendingCommand.Transaction = transaction;
+                    pendingCommand.CommandText = @"
+SELECT COUNT(*)
+FROM sync_checkpoint_items AS item
+JOIN sync_checkpoints AS checkpoint
+  ON checkpoint.checkpoint_id = item.checkpoint_id
+WHERE checkpoint.anchor_key = $anchorKey
+  AND item.completed = 0;";
+                    pendingCommand.Parameters.AddWithValue("$anchorKey", anchorKey);
+                    var pendingCount = (long)pendingCommand.ExecuteScalar();
+                    if (pendingCount != 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"Cannot promote the synchronization anchor while " +
+                            $"{pendingCount} checkpoint item(s) are pending");
+                    }
+                }
+
+                using (var propertyCommand = Connection.CreateCommand())
+                {
+                    propertyCommand.Transaction = transaction;
+                    propertyCommand.CommandText = @"
+INSERT INTO store_properties(key, value)
+VALUES ($anchorKey, $anchorTo)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
+                    propertyCommand.Parameters.AddWithValue("$anchorKey", anchorKey);
+                    propertyCommand.Parameters.AddWithValue("$anchorTo", anchorTo);
+                    propertyCommand.ExecuteNonQuery();
+                }
+
+                using (var deleteCommand = Connection.CreateCommand())
+                {
+                    deleteCommand.Transaction = transaction;
+                    deleteCommand.CommandText =
+                        "DELETE FROM sync_checkpoints WHERE anchor_key = $anchorKey;";
+                    deleteCommand.Parameters.AddWithValue("$anchorKey", anchorKey);
+                    deleteCommand.ExecuteNonQuery();
+                }
+
+                transaction.Commit();
+                TryReclaimCheckpointStorage();
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public void ClearSyncCheckpoint(string anchorKey)
+        {
+            if (string.IsNullOrWhiteSpace(anchorKey))
+            {
+                return;
+            }
+
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var command = Connection.CreateCommand();
+                command.CommandText = "DELETE FROM sync_checkpoints WHERE anchor_key = $anchorKey;";
+                command.Parameters.AddWithValue("$anchorKey", anchorKey);
+                command.ExecuteNonQuery();
+                TryReclaimCheckpointStorage();
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        private void TryReclaimCheckpointStorage()
+        {
+            try
+            {
+                // New SQLite stores use auto_vacuum=INCREMENTAL. Reclaim the
+                // temporary checkpoint pages after success/reset so a large initial
+                // revision list does not become permanent database bloat. On older
+                // stores without incremental auto-vacuum this PRAGMA is a no-op.
+                ExecuteNonQuery("PRAGMA incremental_vacuum;");
+            }
+            catch
+            {
+                // Space reclamation is best-effort and must never invalidate a
+                // successfully promoted anchor or a user-requested checkpoint reset.
+            }
+        }
+
+        private static List<string> NormalizeCheckpointIdentityStrings(
+            IEnumerable<IPackageIdentity> packageIdentities)
+        {
+            return (packageIdentities ?? Array.Empty<IPackageIdentity>())
+                .Where(identity => identity != null)
+                .Select(identity => identity.ToString())
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+        }
+
+        private static DateTimeOffset ParseCheckpointTimestamp(string value)
+        {
+            if (DateTimeOffset.TryParse(
+                value,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.RoundtripKind,
+                out var timestamp))
+            {
+                return timestamp;
+            }
+
+            return DateTimeOffset.MinValue;
+        }
+
+        private void UpdateCheckpointProgress(
+            string anchorKey,
+            int completedDelta,
+            string timestamp,
+            SqliteTransaction transaction)
+        {
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+UPDATE sync_checkpoints
+SET completed_items = MIN(total_items, completed_items + $completedDelta),
+    updated_at = $updatedAt
+WHERE anchor_key = $anchorKey;";
+            command.Parameters.AddWithValue("$anchorKey", anchorKey);
+            command.Parameters.AddWithValue("$completedDelta", Math.Max(0, completedDelta));
+            command.Parameters.AddWithValue("$updatedAt", timestamp);
+            command.ExecuteNonQuery();
+        }
+
+        private void UpdateCheckpointTimestamp(
+            string anchorKey,
+            string timestamp,
+            SqliteTransaction transaction)
+        {
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+UPDATE sync_checkpoints
+SET updated_at = $updatedAt
+WHERE anchor_key = $anchorKey;";
+            command.Parameters.AddWithValue("$anchorKey", anchorKey);
+            command.Parameters.AddWithValue("$updatedAt", timestamp);
+            command.ExecuteNonQuery();
         }
 
         public bool ContainsPackage(IPackageIdentity packageIdentity)

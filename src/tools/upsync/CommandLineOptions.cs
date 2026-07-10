@@ -183,10 +183,13 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
         [Option("refresh-categories", Required = false, Default = false, HelpText = "Refresh upstream categories before fetching updates. By default categories are fetched only when missing.")]
         public bool RefreshCategories { get; set; }
 
-        [Option("ignore-sync-anchor", Required = false, Default = false, HelpText = "Ignore the saved upstream WSUS anchor and force a full revision list query.")]
+        [Option("ignore-sync-anchor", Required = false, Default = false, HelpText = "Ignore the saved upstream WSUS anchor and force a full revision list query. Any unfinished local checkpoint for this filter is discarded.")]
         public bool IgnoreSyncAnchor { get; set; }
 
-        [Option("metadata-batch-size", Required = false, Default = 100, HelpText = "Number of update identities retrieved and stored per local batch.")]
+        [Option("reset-sync-checkpoint", Required = false, Default = false, HelpText = "Discard an unfinished local fetch checkpoint for this exact endpoint/filter before starting.")]
+        public bool ResetSyncCheckpoint { get; set; }
+
+        [Option("metadata-batch-size", Required = false, Default = 100, HelpText = "Number of update identities retrieved and stored per local checkpoint batch.")]
         public int MetadataBatchSize { get; set; }
 
         [Option("keep-all-localized-properties", Required = false, Default = false, HelpText = "Do not strip non-requested LocalizedProperties from stored metadata")]

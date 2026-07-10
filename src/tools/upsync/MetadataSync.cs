@@ -199,58 +199,257 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
 
                     MetadataQuery.PrintFilter(sourceFilter, store);
 
-                    Console.WriteLine($"Getting list of updates ...");
                     string anchorKey = BuildSyncAnchorKey(upstreamEndpoint, sourceFilter);
-                    string oldAnchor = null;
-
-                    if (!options.IgnoreSyncAnchor && store is ISyncAnchorStore anchorStore && anchorStore.TryGetSyncAnchor(anchorKey, out var storedAnchor))
-                    {
-                        oldAnchor = storedAnchor;
-                        Console.WriteLine("Using saved upstream sync anchor. Only changed revisions will be requested.");
-                    }
-                    else if (options.IgnoreSyncAnchor)
-                    {
-                        Console.WriteLine("Ignoring saved upstream sync anchor. A full revision list will be requested.");
-                    }
-
-                    var microsoftUpdateSource = new UpstreamUpdatesSource(upstreamEndpoint, sourceFilter, oldAnchor)
-                    {
-                        BatchSize = Math.Max(1, options.MetadataBatchSize)
-                    };
-                    microsoftUpdateSource.MetadataCopyProgress += Program.OnPackageCopyProgress;
-
-                    try
-                    {
-                        microsoftUpdateSource.CopyTo(store, cancellationToken.Token);
-                    }
-                    catch (Exception ex) when (!string.IsNullOrEmpty(oldAnchor))
-                    {
-                        ConsoleOutput.WriteRed($"Incremental fetch failed with the saved anchor: {ex.Message}");
-                        Console.WriteLine("Clearing the saved anchor and retrying once with a full revision list.");
-
-                        if (store is ISyncAnchorStore retryAnchorStore)
-                        {
-                            retryAnchorStore.ClearSyncAnchor(anchorKey);
-                        }
-
-                        microsoftUpdateSource = new UpstreamUpdatesSource(upstreamEndpoint, sourceFilter, null)
-                        {
-                            BatchSize = Math.Max(1, options.MetadataBatchSize)
-                        };
-                        microsoftUpdateSource.MetadataCopyProgress += Program.OnPackageCopyProgress;
-                        microsoftUpdateSource.CopyTo(store, cancellationToken.Token);
-                    }
-
-                    if (store is ISyncAnchorStore finalAnchorStore && !string.IsNullOrEmpty(microsoftUpdateSource.NewAnchor))
-                    {
-                        finalAnchorStore.SetSyncAnchor(anchorKey, microsoftUpdateSource.NewAnchor);
-                        Console.WriteLine("Saved upstream sync anchor for the next incremental fetch.");
-                    }
+                    FetchMicrosoftUpdateRevisions(
+                        options,
+                        store,
+                        upstreamEndpoint,
+                        sourceFilter,
+                        anchorKey,
+                        cancellationToken.Token);
 
                     Console.WriteLine();
                     Console.WriteLine("Done!");
                 }
             }
+        }
+
+        private static void FetchMicrosoftUpdateRevisions(
+            FetchPackagesOptions options,
+            IMetadataStore store,
+            MicrosoftUpdate.Source.Endpoint upstreamEndpoint,
+            UpstreamSourceFilter sourceFilter,
+            string anchorKey,
+            CancellationToken cancellationToken)
+        {
+            var anchorStore = store as ISyncAnchorStore;
+            var checkpointStore = store as ISyncCheckpointStore;
+            var batchSize = Math.Max(1, options.MetadataBatchSize);
+
+            if (checkpointStore != null &&
+                (options.ResetSyncCheckpoint || options.IgnoreSyncAnchor) &&
+                checkpointStore.TryGetSyncCheckpoint(anchorKey, out var checkpointToDiscard))
+            {
+                checkpointStore.ClearSyncCheckpoint(anchorKey);
+                Console.WriteLine(
+                    $"Discarded unfinished local checkpoint " +
+                    $"({checkpointToDiscard.CompletedItems}/{checkpointToDiscard.TotalItems} revisions completed).");
+            }
+
+            string stableAnchor = null;
+            if (!options.IgnoreSyncAnchor &&
+                anchorStore != null &&
+                anchorStore.TryGetSyncAnchor(anchorKey, out var storedAnchor))
+            {
+                stableAnchor = storedAnchor;
+            }
+
+            if (options.IgnoreSyncAnchor)
+            {
+                Console.WriteLine("Ignoring saved upstream sync anchor. A full revision list will be requested.");
+            }
+
+            if (!options.IgnoreSyncAnchor &&
+                checkpointStore != null &&
+                checkpointStore.TryGetSyncCheckpoint(anchorKey, out var existingCheckpoint))
+            {
+                if (!AnchorValuesEqual(stableAnchor, existingCheckpoint.AnchorFrom))
+                {
+                    throw new InvalidOperationException(
+                        "The unfinished local checkpoint does not match the currently saved WSUS anchor. " +
+                        "Run again with --reset-sync-checkpoint to discard the checkpoint, or add " +
+                        "--ignore-sync-anchor to force a new full revision-list request.");
+                }
+
+                Console.WriteLine(
+                    $"Resuming local fetch checkpoint: {existingCheckpoint.CompletedItems}/" +
+                    $"{existingCheckpoint.TotalItems} revision(s) already stored. " +
+                    "GetRevisionIdList will not be called again.");
+
+                var resumeSource = CreateUpdateSource(
+                    upstreamEndpoint,
+                    sourceFilter,
+                    existingCheckpoint.AnchorFrom,
+                    batchSize);
+                ResumeSyncCheckpoint(
+                    store,
+                    checkpointStore,
+                    resumeSource,
+                    anchorKey,
+                    batchSize,
+                    cancellationToken);
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(stableAnchor))
+            {
+                Console.WriteLine("Using saved upstream sync anchor. Only changed revisions will be requested.");
+            }
+
+            Console.WriteLine("Getting list of updates ...");
+            var microsoftUpdateSource = CreateUpdateSource(
+                upstreamEndpoint,
+                sourceFilter,
+                stableAnchor,
+                batchSize);
+
+            if (checkpointStore == null)
+            {
+                microsoftUpdateSource.CopyTo(store, cancellationToken);
+                if (anchorStore != null && !string.IsNullOrEmpty(microsoftUpdateSource.NewAnchor))
+                {
+                    anchorStore.SetSyncAnchor(anchorKey, microsoftUpdateSource.NewAnchor);
+                    Console.WriteLine("Saved upstream sync anchor for the next incremental fetch.");
+                }
+
+                return;
+            }
+
+            var revisionIdentities = microsoftUpdateSource.GetPackageIdentities();
+            if (string.IsNullOrWhiteSpace(microsoftUpdateSource.NewAnchor))
+            {
+                throw new InvalidOperationException(
+                    "The upstream server returned a revision list without a new anchor. " +
+                    "The result cannot be checkpointed safely.");
+            }
+
+            checkpointStore.CreateSyncCheckpoint(
+                anchorKey,
+                stableAnchor,
+                microsoftUpdateSource.NewAnchor,
+                revisionIdentities);
+
+            if (!checkpointStore.TryGetSyncCheckpoint(anchorKey, out var createdCheckpoint))
+            {
+                throw new InvalidOperationException(
+                    "The local sync checkpoint was created but could not be read back.");
+            }
+
+            Console.WriteLine(
+                $"The upstream returned {revisionIdentities.Count} revision identity/identities. " +
+                $"The local checkpoint contains {createdCheckpoint.TotalItems} item(s) not already stored. " +
+                "The new WSUS anchor will remain inactive until every checkpoint item is committed.");
+
+            ResumeSyncCheckpoint(
+                store,
+                checkpointStore,
+                microsoftUpdateSource,
+                anchorKey,
+                batchSize,
+                cancellationToken);
+        }
+
+        private static UpstreamUpdatesSource CreateUpdateSource(
+            MicrosoftUpdate.Source.Endpoint upstreamEndpoint,
+            UpstreamSourceFilter sourceFilter,
+            string oldAnchor,
+            int batchSize)
+        {
+            var source = new UpstreamUpdatesSource(upstreamEndpoint, sourceFilter, oldAnchor)
+            {
+                BatchSize = Math.Max(1, batchSize)
+            };
+            source.MetadataCopyProgress += Program.OnPackageCopyProgress;
+            return source;
+        }
+
+        private static void ResumeSyncCheckpoint(
+            IMetadataStore store,
+            ISyncCheckpointStore checkpointStore,
+            UpstreamUpdatesSource microsoftUpdateSource,
+            string anchorKey,
+            int batchSize,
+            CancellationToken cancellationToken)
+        {
+            // Repair the safe crash window where package rows committed but the
+            // corresponding checkpoint status update did not run yet.
+            checkpointStore.ReconcileSyncCheckpoint(anchorKey);
+
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (!checkpointStore.TryGetSyncCheckpoint(anchorKey, out var checkpoint))
+                {
+                    throw new InvalidOperationException("The local synchronization checkpoint disappeared before completion.");
+                }
+
+                if (checkpoint.PendingItems == 0)
+                {
+                    // This transaction both promotes AnchorTo and deletes the
+                    // checkpoint. There is no state where the anchor is advanced
+                    // while pending items still exist.
+                    checkpointStore.CompleteSyncCheckpoint(anchorKey);
+                    Console.WriteLine();
+                    Console.WriteLine("Checkpoint complete. Promoted the new WSUS anchor atomically.");
+                    return;
+                }
+
+                var pendingItems = checkpointStore
+                    .GetPendingSyncCheckpointItems(anchorKey, batchSize)
+                    .ToList();
+                if (pendingItems.Count == 0)
+                {
+                    throw new InvalidOperationException(
+                        $"The checkpoint reports {checkpoint.PendingItems} pending item(s), but no pending identities could be read.");
+                }
+
+                var pendingUpdates = pendingItems
+                    .Select(identity => identity as MicrosoftUpdatePackageIdentity
+                        ?? throw new InvalidOperationException($"Unsupported checkpoint identity: {identity}"))
+                    .ToList();
+
+                checkpointStore.MarkSyncCheckpointItemsAttempted(anchorKey, pendingItems);
+                try
+                {
+                    microsoftUpdateSource.CopyPackagesTo(
+                        store,
+                        pendingUpdates,
+                        cancellationToken,
+                        completedItems => checkpointStore.MarkSyncCheckpointItemsCompleted(
+                            anchorKey,
+                            completedItems));
+                }
+                catch (Exception ex)
+                {
+                    try
+                    {
+                        checkpointStore.MarkSyncCheckpointItemsFailed(anchorKey, pendingItems, ex.Message);
+                        checkpointStore.ReconcileSyncCheckpoint(anchorKey);
+                    }
+                    catch
+                    {
+                        // Preserve the original network/storage error. The next
+                        // run will reconcile package rows against pending items.
+                    }
+
+                    if (checkpointStore.TryGetSyncCheckpoint(anchorKey, out var failedCheckpoint))
+                    {
+                        Console.WriteLine();
+                        ConsoleOutput.WriteRed(
+                            $"Fetch interrupted. Checkpoint kept: {failedCheckpoint.CompletedItems}/" +
+                            $"{failedCheckpoint.TotalItems} revision(s) complete. Rerun the same command to resume.");
+                    }
+
+                    throw new InvalidOperationException(
+                        "The fetch checkpoint was retained and the stable WSUS anchor was not advanced.",
+                        ex);
+                }
+
+                if (checkpointStore.TryGetSyncCheckpoint(anchorKey, out var updatedCheckpoint))
+                {
+                    Console.WriteLine();
+                    Console.WriteLine(
+                        $"Checkpoint progress: {updatedCheckpoint.CompletedItems}/" +
+                        $"{updatedCheckpoint.TotalItems} revision(s) stored; " +
+                        $"{updatedCheckpoint.PendingItems} remaining.");
+                }
+            }
+        }
+
+        private static bool AnchorValuesEqual(string left, string right)
+        {
+            return string.Equals(left ?? string.Empty, right ?? string.Empty, StringComparison.Ordinal);
         }
 
         private static void UpdateConsoleForMessageRefresh()
