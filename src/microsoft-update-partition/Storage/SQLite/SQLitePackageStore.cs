@@ -28,15 +28,16 @@ namespace Microsoft.PackageGraph.Storage.Local
     /// <summary>
     /// SQLite-backed local metadata store.
     ///
-    /// This replaces the historical local store layout that created append-only
-    /// delta archives named 0.zip, 1.zip, ... . Metadata, file metadata and the
-    /// serialized index container now live in store/metadata.sqlite.
+    /// Microsoft Update packages are stored as normalized relational rows in
+    /// store/metadata.sqlite. This implementation deliberately does not migrate or open
+    /// historical zip-delta stores or older SQLite schemas.
     /// </summary>
-    class SQLitePackageStore : IMetadataSink, IMetadataStore, IMetadataLookup, IMicrosoftUpdateFileLocationLookup, ISyncAnchorStore, ISyncCheckpointStore
+    partial class SQLitePackageStore : IMetadataSink, IMetadataStore, IMetadataLookup, IMicrosoftUpdateFileLocationLookup, ISyncAnchorStore, ISyncCheckpointStore
     {
         public const string DatabaseFileName = "metadata.sqlite";
 
-        private const int SchemaVersion = 3;
+        private const int SchemaVersion = 5;
+        private const string RelationalStorageModel = "relational-v1";
         private const string IndexBlobKey = "indexes.zip";
         private const string CompressionNone = "none";
         private const string CompressionBrotli = "br";
@@ -51,6 +52,7 @@ namespace Microsoft.PackageGraph.Storage.Local
         private Dictionary<IPackageIdentity, int> _IdentityToIndexMap = new();
         private Dictionary<int, IPackageIdentity> _IndexToIdentityMap = new();
         private Dictionary<int, int> _PackageTypeIndex = new();
+        private HashSet<int> _RelationalPackageIndexes = new();
 
         private int _NextPackageIndex;
         private bool IsDirty;
@@ -79,7 +81,7 @@ namespace Microsoft.PackageGraph.Storage.Local
         /// <inheritdoc cref="IMetadataStore.IsMetadataIndexingSupported"/>
         public bool IsMetadataIndexingSupported { get; private set; } = true;
 
-        private SQLitePackageStore(string path, FileMode mode, bool autoReindex = true)
+        private SQLitePackageStore(string path, FileMode mode)
         {
             TargetPath = path;
             DatabasePath = Path.Combine(TargetPath, DatabaseFileName);
@@ -100,7 +102,6 @@ namespace Microsoft.PackageGraph.Storage.Local
             }
 
             var isNewDatabase = !File.Exists(DatabasePath);
-
             var connectionString = new SqliteConnectionStringBuilder
             {
                 DataSource = DatabasePath,
@@ -121,15 +122,41 @@ namespace Microsoft.PackageGraph.Storage.Local
             ExecuteNonQuery("PRAGMA synchronous=NORMAL;");
             ExecuteNonQuery("PRAGMA foreign_keys=ON;");
 
-            InitializeSchema();
-            EnsureCompressionSchema();
-            LoadPackageMaps();
-            LoadIndexes();
-
-            if (autoReindex && _IsReindexingRequired)
+            if (isNewDatabase)
             {
-                CheckIndex(true);
-                Flush();
+                InitializeSchema();
+                EnsureCompressionSchema();
+                InitializeRelationalSchema();
+                WriteProperty("storage_model", RelationalStorageModel);
+            }
+            else
+            {
+                ValidateExistingStoreFormat();
+            }
+
+            LoadPackageMaps();
+            Indexes = ZipStreamIndexContainer.Create();
+            _IsReindexingRequired = false;
+        }
+
+        private void ValidateExistingStoreFormat()
+        {
+            using var tableCommand = Connection.CreateCommand();
+            tableCommand.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='store_properties';";
+            if (Convert.ToInt32((long)tableCommand.ExecuteScalar(), CultureInfo.InvariantCulture) != 1)
+            {
+                throw new InvalidDataException(
+                    "Unsupported metadata.sqlite format. Delete the database and run a fresh fetch.");
+            }
+
+            var version = ReadProperty("schema_version");
+            var storageModel = ReadProperty("storage_model");
+            if (!string.Equals(version, SchemaVersion.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal) ||
+                !string.Equals(storageModel, RelationalStorageModel, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    $"Unsupported metadata.sqlite schema (version={version ?? "missing"}, model={storageModel ?? "missing"}). " +
+                    "Delete metadata.sqlite and run a fresh fetch; automatic migration is intentionally unsupported.");
             }
         }
 
@@ -329,6 +356,7 @@ WHERE package_index IS NOT NULL;");
                 _IdentityToIndexMap = new Dictionary<IPackageIdentity, int>();
                 _IndexToIdentityMap = new Dictionary<int, IPackageIdentity>();
                 _PackageTypeIndex = new Dictionary<int, int>();
+                _RelationalPackageIndexes = new HashSet<int>();
 
                 var progressArgs = new PackageStoreEventArgs { Total = CountPackages(), Current = 0 };
                 OpenProgress?.Invoke(this, progressArgs);
@@ -350,6 +378,7 @@ ORDER BY package_index;";
                     _IndexToIdentityMap.Add(packageIndex, identity);
                     _IdentityToIndexMap.Add(identity, packageIndex);
                     _PackageTypeIndex.Add(packageIndex, packageType);
+                    _RelationalPackageIndexes.Add(packageIndex);
 
                     progressArgs.Current++;
                     if (progressArgs.Current % 1000 == 0)
@@ -393,6 +422,13 @@ ORDER BY package_index;";
 
         private void LoadIndexes()
         {
+            if (!HasLegacyPackages())
+            {
+                Indexes = ZipStreamIndexContainer.Create();
+                _IsReindexingRequired = false;
+                return;
+            }
+
             var indexData = ReadBlob(IndexBlobKey);
             if (indexData != null && indexData.Length > 0)
             {
@@ -406,14 +442,15 @@ ORDER BY package_index;";
             else
             {
                 Indexes = ZipStreamIndexContainer.Create();
-                _IsReindexingRequired = _IdentityToIndexMap.Count > 0;
+                _IsReindexingRequired = LegacyPackageCount() > 0;
             }
 
-            var indexedPackageCountString = ReadProperty("indexed_package_count");
+            var indexedPackageCountString = ReadProperty("indexed_legacy_package_count")
+                ?? ReadProperty("indexed_package_count");
             if (!int.TryParse(indexedPackageCountString, out var indexedPackageCount) ||
-                indexedPackageCount != _IdentityToIndexMap.Count)
+                indexedPackageCount != LegacyPackageCount())
             {
-                _IsReindexingRequired = _IdentityToIndexMap.Count > 0;
+                _IsReindexingRequired = LegacyPackageCount() > 0;
             }
         }
 
@@ -462,7 +499,7 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
             command.Parameters.AddWithValue("$value", indexBytes);
             command.ExecuteNonQuery();
 
-            WriteProperty("indexed_package_count", _IdentityToIndexMap.Count.ToString());
+            WriteProperty("indexed_legacy_package_count", LegacyPackageCount().ToString(CultureInfo.InvariantCulture));
 
             Indexes.CloseInput();
             IndexBackingStream?.Dispose();
@@ -1260,22 +1297,7 @@ WHERE anchor_key = $anchorKey;";
 
         private byte[] ReadMetadataBytes(int packageIndex)
         {
-            using var command = Connection.CreateCommand();
-            command.CommandText = @"
-SELECT metadata, COALESCE(metadata_compression, 'none')
-FROM packages
-WHERE package_index = $packageIndex;";
-            command.Parameters.AddWithValue("$packageIndex", packageIndex);
-
-            using var reader = command.ExecuteReader();
-            if (!reader.Read())
-            {
-                throw new KeyNotFoundException();
-            }
-
-            var metadata = (byte[])reader[0];
-            var compression = reader.IsDBNull(1) ? CompressionNone : reader.GetString(1);
-            return DecompressBytes(metadata, compression);
+            return BuildRelationalMetadataBytes(packageIndex);
         }
 
         public List<T> GetFiles<T>(IPackageIdentity packageIdentity)
@@ -1288,34 +1310,12 @@ WHERE package_index = $packageIndex;";
                     throw new KeyNotFoundException();
                 }
 
-                if (typeof(T) == typeof(UpdateFile))
-                {
-                    var parsedFiles = ReadFilesFromMetadata(packageIndex);
-                    if (parsedFiles.Count > 0)
-                    {
-                        return parsedFiles.Cast<T>().ToList();
-                    }
-                }
-
-                // Compatibility fallback for databases created by earlier patches that stored
-                // full UpdateFile JSON blobs in SQLite. New stores no longer write this payload.
-                var mappedFileJsonList = ReadMappedFileJsonList(packageIndex);
-                if (mappedFileJsonList.Count > 0)
-                {
-                    return mappedFileJsonList
-                        .Select(fileJson => JsonConvert.DeserializeObject<UpdateFile>(fileJson))
-                        .Where(file => file != null)
-                        .Cast<T>()
-                        .ToList();
-                }
-
-                var filesJson = ReadFilesJson(packageIndex);
-                if (string.IsNullOrEmpty(filesJson))
+                if (typeof(T) != typeof(UpdateFile))
                 {
                     return new List<T>();
                 }
 
-                return JsonConvert.DeserializeObject<List<T>>(filesJson) ?? new List<T>();
+                return ReadRelationalFiles(packageIndex).Cast<T>().ToList();
             }
             finally
             {
@@ -1369,19 +1369,20 @@ WHERE package_index = $packageIndex;";
             var urls = new Dictionary<string, UpdateFileUrl>(StringComparer.Ordinal);
             using var command = Connection.CreateCommand();
             command.CommandText = @"
-SELECT fl.sha1_base64, fl.mu_url
+SELECT fl.sha1_base64, fl.mu_url, fl.uss_url
 FROM package_file_map pfm
 JOIN file_locations fl ON fl.sha1_base64 = pfm.sha1_base64
 WHERE pfm.package_index = $packageIndex
-  AND fl.mu_url IS NOT NULL;";
+  AND (fl.mu_url IS NOT NULL OR fl.uss_url IS NOT NULL);";
             command.Parameters.AddWithValue("$packageIndex", packageIndex);
 
             using var reader = command.ExecuteReader();
             while (reader.Read())
             {
                 var digestBase64 = reader.GetString(0);
-                var url = reader.GetString(1);
-                urls[digestBase64] = new UpdateFileUrl(digestBase64, url, null);
+                var muUrl = reader.IsDBNull(1) ? null : reader.GetString(1);
+                var ussUrl = reader.IsDBNull(2) ? null : reader.GetString(2);
+                urls[digestBase64] = new UpdateFileUrl(digestBase64, muUrl, ussUrl);
             }
 
             return urls;
@@ -1464,41 +1465,9 @@ WHERE package_index = $packageIndex;";
             try
             {
                 var files = new List<UpdateFile>();
-                using var command = Connection.CreateCommand();
-                command.CommandText = @"
-SELECT file_blob, file_compression, file_json
-FROM file_locations
-WHERE sha1_base64 = $sha1;";
-                var parameter = command.CreateParameter();
-                parameter.ParameterName = "$sha1";
-                command.Parameters.Add(parameter);
-
                 foreach (var digest in requested)
                 {
-                    parameter.Value = digest;
-                    using var reader = command.ExecuteReader();
-                    if (!reader.Read())
-                    {
-                        continue;
-                    }
-
-                    string fileJson;
-                    if (!reader.IsDBNull(0))
-                    {
-                        var blob = (byte[])reader[0];
-                        var compression = reader.IsDBNull(1) ? CompressionNone : reader.GetString(1);
-                        fileJson = DecompressString(blob, compression);
-                    }
-                    else if (!reader.IsDBNull(2))
-                    {
-                        fileJson = reader.GetString(2);
-                    }
-                    else
-                    {
-                        continue;
-                    }
-
-                    var file = JsonConvert.DeserializeObject<UpdateFile>(fileJson);
+                    var file = ReadRelationalFileBySha1(digest);
                     if (file != null)
                     {
                         files.Add(file);
@@ -1525,8 +1494,6 @@ WHERE sha1_base64 = $sha1;";
                 return;
             }
 
-            CheckIndex();
-
             StateLock.EnterWriteLock();
             try
             {
@@ -1544,21 +1511,30 @@ WHERE sha1_base64 = $sha1;";
                         continue;
                     }
 
+                    if (package is not MicrosoftUpdatePackage microsoftUpdatePackage)
+                    {
+                        throw new NotSupportedException(
+                            "The clean relational local store only accepts Microsoft Update packages.");
+                    }
+
                     var packageIndex = _NextPackageIndex + stagedPackages.Count;
                     var packageType = GetPackageType(package);
-                    var metadataStorage = GetMetadataStorageBytes(package);
-
-                    // Do not store the full per-package file list here. File metadata is deduplicated
-                    // by SHA1 in file_locations and associated to packages through package_file_map.
-                    InsertPackage(package, packageIndex, packageType, metadataStorage.Bytes, metadataStorage.Compression, null, transaction);
-                    InsertFileLocations(package, packageIndex, transaction);
+                    const bool isRelational = true;
+                    var relationalRecord = RelationalMetadataExtractor.Extract(microsoftUpdatePackage);
+                    InsertRelationalPackage(
+                        package,
+                        packageIndex,
+                        packageType,
+                        relationalRecord,
+                        transaction);
 
                     stagedPackages.Add(new StagedPackage
                     {
                         Package = package,
                         Identity = package.Id,
                         PackageIndex = packageIndex,
-                        PackageType = packageType
+                        PackageType = packageType,
+                        IsRelational = isRelational
                     });
                     stagedIdentities.Add(package.Id);
 
@@ -1576,7 +1552,16 @@ WHERE sha1_base64 = $sha1;";
                     _IdentityToIndexMap.Add(stagedPackage.Identity, stagedPackage.PackageIndex);
                     _IndexToIdentityMap.Add(stagedPackage.PackageIndex, stagedPackage.Identity);
                     _PackageTypeIndex.Add(stagedPackage.PackageIndex, stagedPackage.PackageType);
-                    Indexes.IndexPackage(stagedPackage.Package, stagedPackage.PackageIndex);
+                    if (stagedPackage.IsRelational)
+                    {
+                        _RelationalPackageIndexes.Add(stagedPackage.PackageIndex);
+                    }
+                    else
+                    {
+                        Indexes.IndexPackage(stagedPackage.Package, stagedPackage.PackageIndex);
+                        IsIndexDirty = true;
+                    }
+
                     PendingPackages.Add(stagedPackage.Package);
                 }
 
@@ -1585,7 +1570,7 @@ WHERE sha1_base64 = $sha1;";
                 if (stagedPackages.Count > 0)
                 {
                     IsDirty = true;
-                    IsIndexDirty = true;
+                    UpdateStorageModelProperty();
                 }
 
                 PackagesAddProgress?.Invoke(this, progressArgs);
@@ -1828,7 +1813,7 @@ VALUES ($packageIndex, $sha1Base64);";
                 throw new FileNotFoundException("The SQLite metadata store does not exist", Path.Combine(path, DatabaseFileName));
             }
 
-            using (var store = new SQLitePackageStore(path, FileMode.Open, false))
+            using (var store = new SQLitePackageStore(path, FileMode.Open))
             {
                 store.OptimizeRows(rebuildIndexes, log);
             }
@@ -1844,33 +1829,53 @@ VALUES ($packageIndex, $sha1Base64);";
             StateLock.EnterWriteLock();
             try
             {
-                log?.Invoke("Compressing package XML metadata stored in SQLite...");
+                log?.Invoke("Optimizing SQLite metadata rows...");
                 var compressedMetadataRows = CompressUncompressedPackageMetadata(log);
-
-                log?.Invoke("Pruning duplicated package file metadata stored in SQLite...");
                 var prunedPackageFileRows = PrunePackageFiles(log);
 
-                log?.Invoke("Rebuilding compact SHA1 -> Microsoft URL lookup table...");
-                var rebuiltFileLocationRows = RebuildFileLocationsTableCompact(log);
-
-                if (rebuildIndexes)
+                using (var countCommand = Connection.CreateCommand())
                 {
-                    log?.Invoke("Rebuilding indexes without embedding the full file-location payload...");
-                    CheckIndex(true);
-                    WriteIndexes();
-                    IsDirty = false;
-                    IsIndexDirty = false;
+                    countCommand.CommandText = @"
+SELECT COUNT(*)
+FROM file_locations
+WHERE file_json IS NOT NULL
+   OR file_blob IS NOT NULL
+   OR file_compression IS NOT NULL;";
+                    var filePayloadRows = Convert.ToInt32((long)countCommand.ExecuteScalar());
+                    ExecuteNonQuery(@"
+UPDATE file_locations
+SET file_json = NULL,
+    file_blob = NULL,
+    file_compression = NULL
+WHERE file_json IS NOT NULL
+   OR file_blob IS NOT NULL
+   OR file_compression IS NOT NULL;");
+                    log?.Invoke($"Pruned duplicated file-location payload rows: {filePayloadRows}");
                 }
 
-                WriteProperty("schema_version", SchemaVersion.ToString());
-                WriteProperty("metadata_compression", CompressionBrotli);
-                WriteProperty("files_storage", "metadata-xml-plus-file-location-map");
-                WriteProperty("file_locations_storage", "sha1-url-only");
+                if (rebuildIndexes && HasLegacyPackages())
+                {
+                    log?.Invoke("Rebuilding indexes for the remaining legacy XML packages...");
+                    CheckIndex(true);
+                    WriteIndexes();
+                    IsIndexDirty = false;
+                }
+                else if (!HasLegacyPackages())
+                {
+                    ExecuteNonQuery("DELETE FROM store_blobs WHERE key = 'indexes.zip';");
+                    ExecuteNonQuery("DELETE FROM store_properties WHERE key IN ('indexed_package_count', 'indexed_legacy_package_count');");
+                }
+
+                IsDirty = false;
+                WriteProperty("schema_version", SchemaVersion.ToString(CultureInfo.InvariantCulture));
+                UpdateStorageModelProperty();
+                WriteProperty("files_storage", "normalized-file-location-map");
+                WriteProperty("file_locations_storage", "sha1-digests-url-relational");
 
                 ExecuteNonQuery("PRAGMA optimize;");
                 ExecuteNonQuery("PRAGMA wal_checkpoint(TRUNCATE);");
 
-                log?.Invoke($"SQLite store optimization done. Compressed metadata rows: {compressedMetadataRows}; pruned package file rows: {prunedPackageFileRows}; file-location rows: {rebuiltFileLocationRows}.");
+                log?.Invoke($"SQLite store optimization done. Compressed legacy metadata rows: {compressedMetadataRows}; pruned package file rows: {prunedPackageFileRows}.");
             }
             finally
             {
@@ -2151,13 +2156,9 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
             StateLock.EnterWriteLock();
             try
             {
-                if (IsDirty || IsIndexDirty)
-                {
-                    WriteIndexes();
-                    IsDirty = false;
-                    IsIndexDirty = false;
-                    PendingPackages.Clear();
-                }
+                IsDirty = false;
+                IsIndexDirty = false;
+                PendingPackages.Clear();
             }
             finally
             {
@@ -2167,47 +2168,13 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
 
         private void CheckIndex(bool forceReindex = false)
         {
-            StateLock.EnterWriteLock();
-            try
-            {
-                if (!_IsReindexingRequired && !forceReindex)
-                {
-                    return;
-                }
-
-                Indexes.ResetIndex();
-
-                var progressEvent = new PackageStoreEventArgs
-                {
-                    Total = _IdentityToIndexMap.Count,
-                    Current = 0
-                };
-
-                foreach (var packageIndex in _IndexToIdentityMap.Keys.OrderBy(i => i).ToList())
-                {
-                    var parsedPackage = CreatePackageFromStoredMetadata(packageIndex);
-                    Indexes.IndexPackage(parsedPackage, packageIndex);
-
-                    progressEvent.Current++;
-                    if (progressEvent.Current % 100 == 0)
-                    {
-                        PackageIndexingProgress?.Invoke(this, progressEvent);
-                    }
-                }
-
-                PackageIndexingProgress?.Invoke(this, progressEvent);
-                _IsReindexingRequired = false;
-                IsIndexDirty = true;
-            }
-            finally
-            {
-                StateLock.ExitWriteLock();
-            }
+            _IsReindexingRequired = false;
+            IsIndexDirty = false;
         }
 
         public void ReIndex()
         {
-            CheckIndex(true);
+            // Relational indexes are maintained transactionally by SQLite.
         }
 
         public IReadOnlyList<IPackage> GetPendingPackages()
@@ -2294,7 +2261,7 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
                     throw new KeyNotFoundException();
                 }
 
-                return Indexes.TrySimpleKeyLookup(packageIndex, indexName, out value);
+                return TryRelationalSimpleKeyLookup(packageIndex, indexName, out value);
             }
             finally
             {
@@ -2312,14 +2279,7 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
                     throw new KeyNotFoundException();
                 }
 
-                if (string.Equals(indexName, Microsoft.PackageGraph.MicrosoftUpdate.Index.AvailableIndexes.FilesIndexName, StringComparison.Ordinal) &&
-                    typeof(T) == typeof(UpdateFile))
-                {
-                    value = GetFiles<UpdateFile>(packageIdentity).Cast<T>().ToList();
-                    return value.Count > 0;
-                }
-
-                return Indexes.TryListKeyLookup(packageIndex, indexName, out value);
+                return TryRelationalListKeyLookup(packageIndex, indexName, out value);
             }
             finally
             {
@@ -2332,9 +2292,11 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
             StateLock.EnterReadLock();
             try
             {
-                if (Indexes.TryPackageLookupByCustomKey(key, indexName, out var packageIndex))
+                if (TryRelationalPackageListLookupByCustomKey(key, indexName, out var relationalValues) &&
+                    relationalValues.Count > 0)
                 {
-                    return _IndexToIdentityMap.TryGetValue(packageIndex, out value);
+                    value = relationalValues[0];
+                    return true;
                 }
 
                 value = null;
@@ -2351,17 +2313,15 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
             StateLock.EnterReadLock();
             try
             {
-                if (Indexes.TryPackageListLookupByCustomKey(key, indexName, out List<int> packageIndexes))
+                var results = new List<IPackageIdentity>();
+                if (TryRelationalPackageListLookupByCustomKey(key, indexName, out var relationalValues) &&
+                    relationalValues != null)
                 {
-                    value = packageIndexes
-                        .Where(packageIndex => _IndexToIdentityMap.ContainsKey(packageIndex))
-                        .Select(packageIndex => _IndexToIdentityMap[packageIndex])
-                        .ToList();
-                    return true;
+                    results.AddRange(relationalValues);
                 }
 
-                value = null;
-                return false;
+                value = results.Distinct().ToList();
+                return value.Count > 0;
             }
             finally
             {
@@ -2374,7 +2334,7 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
             StateLock.EnterReadLock();
             try
             {
-                return Indexes.GetLoadedIndexes();
+                return GetRelationalIndexDefinitions();
             }
             finally
             {
@@ -2411,6 +2371,7 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
                 _IndexToIdentityMap.Clear();
                 _IdentityToIndexMap.Clear();
                 _PackageTypeIndex.Clear();
+                _RelationalPackageIndexes.Clear();
                 PendingPackages.Clear();
 
                 IsDisposed = true;
@@ -2441,6 +2402,7 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
             public IPackageIdentity Identity { get; set; }
             public int PackageIndex { get; set; }
             public int PackageType { get; set; }
+            public bool IsRelational { get; set; }
         }
 
         private sealed class MetadataEnumerator : IEnumerator<IPackage>

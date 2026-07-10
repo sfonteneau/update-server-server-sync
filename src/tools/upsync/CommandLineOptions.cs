@@ -142,6 +142,7 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
         public bool RebuildIndexes { get; set; }
     }
 
+
     [Verb("fetch", HelpText = "Retrieves metadata from an upstream server")]
     public class FetchPackagesOptions : IMetadataStoreOptions, IMetadataSourceOptions
     {

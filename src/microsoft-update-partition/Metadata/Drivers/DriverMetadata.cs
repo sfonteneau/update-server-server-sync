@@ -4,6 +4,7 @@
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Xml;
 using System.Xml.XPath;
 
@@ -118,6 +119,35 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Drivers
 
         [JsonConstructor]
         private DriverMetadata() { }
+
+        internal DriverMetadata(
+            string hardwareId,
+            string whqlDriverId,
+            string manufacturer,
+            string company,
+            string provider,
+            DateTime driverDate,
+            ulong driverVersion,
+            string driverClass,
+            IEnumerable<DriverFeatureScore> featureScores,
+            IEnumerable<Guid> distributionComputerHardwareIds,
+            IEnumerable<Guid> targetComputerHardwareIds)
+        {
+            HardwareID = hardwareId?.ToLowerInvariant();
+            WhqlDriverID = whqlDriverId;
+            Manufacturer = manufacturer;
+            Company = company;
+            Provider = provider;
+            Versioning = new DriverVersion
+            {
+                Date = driverDate,
+                Version = driverVersion
+            };
+            Class = driverClass;
+            FeatureScores = featureScores?.ToList() ?? new List<DriverFeatureScore>();
+            DistributionComputerHardwareId = distributionComputerHardwareIds?.ToList() ?? new List<Guid>();
+            TargetComputerHardwareId = targetComputerHardwareIds?.ToList() ?? new List<Guid>();
+        }
 
         internal DriverMetadata(XPathNavigator driverMetadataNavigator, XmlNamespaceManager namespaceManager)
         {
