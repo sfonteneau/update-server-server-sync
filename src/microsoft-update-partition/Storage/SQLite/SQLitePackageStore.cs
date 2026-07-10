@@ -3930,6 +3930,328 @@ private sealed class RelationalFileReadRow
             }
         }
 
+        private static void ExtractProperties(XElement root, RelationalPackageRecord result)
+        {
+            var properties = DirectChild(root, "Properties");
+            if (properties == null)
+            {
+                throw new InvalidDataException("Microsoft Update metadata has no Properties element");
+            }
+
+            foreach (var attribute in properties.Attributes().Where(attribute => !attribute.IsNamespaceDeclaration))
+            {
+                result.PropertyAttributes.Add(new RelationalNameValue
+                {
+                    Name = attribute.Name.LocalName,
+                    Value = attribute.Value
+                });
+            }
+
+            var ordinal = 0;
+            foreach (var child in properties.Elements())
+            {
+                result.PropertyElements.Add(ToElementValue(child, ordinal++));
+            }
+        }
+
+        private static void ExtractLocalizedProperties(XElement root, RelationalPackageRecord result)
+        {
+            var collection = DirectChild(root, "LocalizedPropertiesCollection");
+            if (collection == null)
+            {
+                return;
+            }
+
+            var candidates = collection.Elements()
+                .Where(element => element.Name.LocalName == "LocalizedProperties")
+                .Select(element => new
+                {
+                    Element = element,
+                    Language = element.Elements()
+                        .FirstOrDefault(child => child.Name.LocalName == "Language")?
+                        .Value?
+                        .Trim()
+                })
+                .Where(candidate => !string.IsNullOrWhiteSpace(candidate.Language))
+                .ToList();
+
+            // Persist one English payload only. Do not relabel a non-English locale as English:
+            // that would save space but return semantically incorrect metadata to Windows clients.
+            var selected = candidates.FirstOrDefault(candidate =>
+                    string.Equals(candidate.Language, "en", StringComparison.OrdinalIgnoreCase))
+                ?? candidates.FirstOrDefault(candidate =>
+                    string.Equals(candidate.Language, "en-us", StringComparison.OrdinalIgnoreCase))
+                ?? candidates.FirstOrDefault(candidate =>
+                    string.Equals(candidate.Language, "en-gb", StringComparison.OrdinalIgnoreCase));
+
+            if (selected == null)
+            {
+                return;
+            }
+
+            var ordinal = 0;
+            foreach (var child in selected.Element.Elements().Where(element => element.Name.LocalName != "Language"))
+            {
+                var value = ToElementValue(child, ordinal++);
+                result.LocalizedElements.Add(new RelationalLocalizedElement
+                {
+                    Language = "en",
+                    Ordinal = value.Ordinal,
+                    Name = value.Name,
+                    Value = value.Value,
+                    Xml = value.Xml
+                });
+            }
+        }
+
+        private static void ExtractRelationships(XElement root, RelationalPackageRecord result)
+        {
+            var relationships = DirectChild(root, "Relationships");
+            if (relationships == null)
+            {
+                return;
+            }
+
+            foreach (var relation in relationships.Elements())
+            {
+                switch (relation.Name.LocalName)
+                {
+                    case PrerequisitesRelationship:
+                        ExtractGroupedRelationship(relation, PrerequisitesRelationship, result, true);
+                        break;
+
+                    case SupersededRelationship:
+                        ExtractFlatRelationship(relation, SupersededRelationship, result);
+                        break;
+
+                    case BundledRelationship:
+                        ExtractGroupedRelationship(relation, BundledRelationship, result, false);
+                        break;
+
+                    default:
+                        result.RelationshipExtraElements.Add(SerializeElement(relation));
+                        break;
+                }
+            }
+        }
+
+        private static void ExtractFlatRelationship(
+            XElement relation,
+            string relationshipType,
+            RelationalPackageRecord result)
+        {
+            var groupOrdinal = 0;
+            result.RelationshipGroups.Add(new RelationalRelationshipGroup
+            {
+                RelationshipType = relationshipType,
+                GroupOrdinal = groupOrdinal,
+                GroupKind = DirectGroup,
+                IsCategory = false
+            });
+
+            var itemOrdinal = 0;
+            foreach (var identityElement in relation.Elements().Where(element => element.Name.LocalName == "UpdateIdentity"))
+            {
+                if (TryReadIdentity(identityElement, out var updateId, out var revision))
+                {
+                    result.RelationshipItems.Add(new RelationalRelationshipItem
+                    {
+                        RelationshipType = relationshipType,
+                        GroupOrdinal = groupOrdinal,
+                        ItemOrdinal = itemOrdinal++,
+                        UpdateId = updateId,
+                        RevisionNumber = revision
+                    });
+                }
+            }
+        }
+
+        private static void ExtractGroupedRelationship(
+            XElement relation,
+            string relationshipType,
+            RelationalPackageRecord result,
+            bool directItemsAreSeparateGroups)
+        {
+            var groupOrdinal = 0;
+
+            var directIdentities = relation.Elements()
+                .Where(element => element.Name.LocalName == "UpdateIdentity")
+                .ToList();
+
+            if (directItemsAreSeparateGroups)
+            {
+                foreach (var identityElement in directIdentities)
+                {
+                    if (!TryReadIdentity(identityElement, out var updateId, out var revision))
+                    {
+                        continue;
+                    }
+
+                    result.RelationshipGroups.Add(new RelationalRelationshipGroup
+                    {
+                        RelationshipType = relationshipType,
+                        GroupOrdinal = groupOrdinal,
+                        GroupKind = DirectGroup,
+                        IsCategory = false
+                    });
+                    result.RelationshipItems.Add(new RelationalRelationshipItem
+                    {
+                        RelationshipType = relationshipType,
+                        GroupOrdinal = groupOrdinal,
+                        ItemOrdinal = 0,
+                        UpdateId = updateId,
+                        RevisionNumber = revision
+                    });
+                    groupOrdinal++;
+                }
+            }
+            else if (directIdentities.Count > 0)
+            {
+                result.RelationshipGroups.Add(new RelationalRelationshipGroup
+                {
+                    RelationshipType = relationshipType,
+                    GroupOrdinal = groupOrdinal,
+                    GroupKind = DirectGroup,
+                    IsCategory = false
+                });
+
+                var itemOrdinal = 0;
+                foreach (var identityElement in directIdentities)
+                {
+                    if (TryReadIdentity(identityElement, out var updateId, out var revision))
+                    {
+                        result.RelationshipItems.Add(new RelationalRelationshipItem
+                        {
+                            RelationshipType = relationshipType,
+                            GroupOrdinal = groupOrdinal,
+                            ItemOrdinal = itemOrdinal++,
+                            UpdateId = updateId,
+                            RevisionNumber = revision
+                        });
+                    }
+                }
+
+                groupOrdinal++;
+            }
+
+            foreach (var atLeastOne in relation.Elements().Where(element => element.Name.LocalName == "AtLeastOne"))
+            {
+                var isCategory = string.Equals(
+                    atLeastOne.Attributes().FirstOrDefault(attribute => attribute.Name.LocalName == "IsCategory")?.Value,
+                    "true",
+                    StringComparison.OrdinalIgnoreCase);
+
+                result.RelationshipGroups.Add(new RelationalRelationshipGroup
+                {
+                    RelationshipType = relationshipType,
+                    GroupOrdinal = groupOrdinal,
+                    GroupKind = AtLeastOneGroup,
+                    IsCategory = isCategory
+                });
+
+                var itemOrdinal = 0;
+                foreach (var identityElement in atLeastOne.Elements().Where(element => element.Name.LocalName == "UpdateIdentity"))
+                {
+                    if (TryReadIdentity(identityElement, out var updateId, out var revision))
+                    {
+                        result.RelationshipItems.Add(new RelationalRelationshipItem
+                        {
+                            RelationshipType = relationshipType,
+                            GroupOrdinal = groupOrdinal,
+                            ItemOrdinal = itemOrdinal++,
+                            UpdateId = updateId,
+                            RevisionNumber = revision
+                        });
+                    }
+                }
+
+                groupOrdinal++;
+            }
+        }
+
+        private static bool TryReadIdentity(XElement element, out Guid updateId, out int? revision)
+        {
+            updateId = Guid.Empty;
+            revision = null;
+
+            var updateIdValue = element.Attributes()
+                .FirstOrDefault(attribute => attribute.Name.LocalName == "UpdateID")?
+                .Value;
+            if (!Guid.TryParse(updateIdValue, out updateId))
+            {
+                return false;
+            }
+
+            var revisionValue = element.Attributes()
+                .FirstOrDefault(attribute => attribute.Name.LocalName == "RevisionNumber")?
+                .Value;
+            if (int.TryParse(revisionValue, out var parsedRevision))
+            {
+                revision = parsedRevision;
+            }
+
+            return true;
+        }
+
+        private static void ExtractApplicability(XElement root, RelationalPackageRecord result)
+        {
+            var applicability = DirectChild(root, "ApplicabilityRules");
+            if (applicability == null)
+            {
+                return;
+            }
+
+            var applicabilityTemplate = new XElement(applicability);
+            var driverMetadataNodes = applicabilityTemplate
+                .Descendants()
+                .Where(element => element.Name.LocalName == "WindowsDriverMetaData")
+                .ToList();
+            foreach (var driverMetadataNode in driverMetadataNodes)
+            {
+                driverMetadataNode.Remove();
+            }
+
+            result.ApplicabilityTemplateXml = SerializeElement(applicabilityTemplate);
+        }
+
+        private static void ExtractHandlerSpecificData(XElement root, RelationalPackageRecord result)
+        {
+            var handler = DirectChild(root, "HandlerSpecificData");
+            result.HandlerSpecificXml = handler == null ? null : SerializeElement(handler);
+        }
+
+        private static RelationalElementValue ToElementValue(XElement element, int ordinal)
+        {
+            var isSimple = !element.HasAttributes && !element.Elements().Any();
+            return new RelationalElementValue
+            {
+                Ordinal = ordinal,
+                Name = element.Name.LocalName,
+                Value = isSimple ? element.Value : null,
+                Xml = isSimple ? null : SerializeElement(element)
+            };
+        }
+
+        private static string SerializeElement(XElement element)
+        {
+            var normalized = new XElement(element);
+            foreach (var whitespace in normalized
+                .DescendantNodes()
+                .OfType<XText>()
+                .Where(text => string.IsNullOrWhiteSpace(text.Value))
+                .ToList())
+            {
+                whitespace.Remove();
+            }
+
+            return normalized.ToString(SaveOptions.DisableFormatting);
+        }
+
+        private static XElement DirectChild(XElement parent, string localName)
+        {
+            return parent.Elements().FirstOrDefault(element => element.Name.LocalName == localName);
+        }
+
         private static List<Guid> ParseHardwareIds(XElement node, string localName)
         {
             var result = new List<Guid>();
