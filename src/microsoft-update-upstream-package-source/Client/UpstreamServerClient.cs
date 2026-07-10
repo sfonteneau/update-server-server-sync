@@ -223,7 +223,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
                     rawId => new MicrosoftUpdatePackageIdentity(rawId.UpdateID, rawId.RevisionNumber));
         }
 
-        internal IEnumerable<MicrosoftUpdatePackageIdentity> GetUpdateIds(UpstreamSourceFilter updatesFilter, out string newAnchor)
+        internal IEnumerable<MicrosoftUpdatePackageIdentity> GetUpdateIds(UpstreamSourceFilter updatesFilter, out string newAnchor, string oldAnchor = null)
         {
             if (AccessToken == null || AccessToken.ExpiresIn(TimeSpan.FromMinutes(2)))
             {
@@ -242,7 +242,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
                 GetRevisionIdList = new GetRevisionIdListRequestBody()
                 {
                     cookie = AccessToken.AccessCookie,
-                    filter = updatesFilter.ToServerSyncFilter()
+                    filter = updatesFilter.ToServerSyncFilter(oldAnchor)
                 }
             };
 
@@ -255,10 +255,11 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
                 throw new Exception("Failed to get revision ID list");
             }
 
-            newAnchor = null;
+            var revisionList = revisionsIdReply.GetRevisionIdListResponse1.GetRevisionIdListResult;
+            newAnchor = revisionList.Anchor;
 
             // Return IDs and the anchor for this query. The anchor can be used to get a delta list in the future.
-            return revisionsIdReply.GetRevisionIdListResponse1.GetRevisionIdListResult.NewRevisions.Select(
+            return (revisionList.NewRevisions ?? Array.Empty<UpdateIdentity>()).Select(
                 rawId => new MicrosoftUpdatePackageIdentity(rawId.UpdateID, rawId.RevisionNumber));
         }
 
@@ -288,8 +289,10 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
 
             var packages = new ConcurrentBag<MicrosoftUpdatePackage>();
 
-            // Run batches in parallel
-            retrieveBatches.AsParallel().ForAll(batch =>
+            // Keep requests sequential for a given WCF client instance. The generated SOAP client is
+            // not guaranteed to be thread-safe, and parallel requests on one client can become slower
+            // than a stable sequential stream because of retries and service throttling.
+            foreach (var batch in retrieveBatches)
             {
                 var updateDataRequest = new GetUpdateDataRequest
                 {
@@ -327,14 +330,14 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
 
                 // Parse the list of raw files into a more usable format
                 var filesList = updateDataReply.GetUpdateDataResponse1.GetUpdateDataResult.fileUrls
-                .Select(rawFile => InMemoryUpdateFactory.FromServerSyncData(rawFile))
-                .ToDictionary(file => file.DigestBase64);
+                    .Select(rawFile => InMemoryUpdateFactory.FromServerSyncData(rawFile))
+                    .ToDictionary(file => file.DigestBase64);
 
-                foreach (var rawUpdate in updateDataReply.GetUpdateDataResponse1.GetUpdateDataResult.updates)
+                foreach (var rawUpdate in updateDataReply.GetUpdateDataResponse1.GetUpdateDataResult.updates ?? Array.Empty<ServerSyncUpdateData>())
                 {
                     packages.Add(InMemoryUpdateFactory.FromServerSyncData(rawUpdate, filesList, sourceFilter));
                 }
-            });
+            }
 
             return packages.ToList();
         }

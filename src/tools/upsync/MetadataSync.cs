@@ -10,6 +10,8 @@ using System.Threading;
 using Microsoft.PackageGraph.MicrosoftUpdate.Source;
 using Microsoft.PackageGraph.Storage;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace Microsoft.PackageGraph.Utilitites.Upsync
 {
@@ -137,15 +139,22 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
 
             using (store)
             {
-                var microsoftUpdateCategoriesSource = new UpstreamCategoriesSource(upstreamEndpoint);
-
-                Console.WriteLine($"Getting list of categories. This might take up to 1 minute ...");
-
-                microsoftUpdateCategoriesSource.MetadataCopyProgress += Program.OnPackageCopyProgress;
                 var cancellationToken = new CancellationTokenSource();
-                microsoftUpdateCategoriesSource.CopyTo(store, cancellationToken.Token);
+                if (options.RefreshCategories || StoreIsEmpty(store))
+                {
+                    var microsoftUpdateCategoriesSource = new UpstreamCategoriesSource(upstreamEndpoint);
 
-                if (options.Ids.Any())
+                    Console.WriteLine($"Getting list of categories. This might take up to 1 minute ...");
+
+                    microsoftUpdateCategoriesSource.MetadataCopyProgress += Program.OnPackageCopyProgress;
+                    microsoftUpdateCategoriesSource.CopyTo(store, cancellationToken.Token);
+                }
+                else
+                {
+                    Console.WriteLine("Using cached categories. Pass --refresh-categories to update them.");
+                }
+
+                if (HasValues(options.Ids))
                 {
                     var server = new UpstreamServerClient(upstreamEndpoint);
 
@@ -190,10 +199,53 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
 
                     MetadataQuery.PrintFilter(sourceFilter, store);
 
-                    Console.WriteLine($"Getting list of updates. This might take up to 1 minute ...");
-                    var microsoftUpdateSource = new UpstreamUpdatesSource(upstreamEndpoint, sourceFilter);
+                    Console.WriteLine($"Getting list of updates ...");
+                    string anchorKey = BuildSyncAnchorKey(upstreamEndpoint, sourceFilter);
+                    string oldAnchor = null;
+
+                    if (!options.IgnoreSyncAnchor && store is ISyncAnchorStore anchorStore && anchorStore.TryGetSyncAnchor(anchorKey, out var storedAnchor))
+                    {
+                        oldAnchor = storedAnchor;
+                        Console.WriteLine("Using saved upstream sync anchor. Only changed revisions will be requested.");
+                    }
+                    else if (options.IgnoreSyncAnchor)
+                    {
+                        Console.WriteLine("Ignoring saved upstream sync anchor. A full revision list will be requested.");
+                    }
+
+                    var microsoftUpdateSource = new UpstreamUpdatesSource(upstreamEndpoint, sourceFilter, oldAnchor)
+                    {
+                        BatchSize = Math.Max(1, options.MetadataBatchSize)
+                    };
                     microsoftUpdateSource.MetadataCopyProgress += Program.OnPackageCopyProgress;
-                    microsoftUpdateSource.CopyTo(store, cancellationToken.Token);
+
+                    try
+                    {
+                        microsoftUpdateSource.CopyTo(store, cancellationToken.Token);
+                    }
+                    catch (Exception ex) when (!string.IsNullOrEmpty(oldAnchor))
+                    {
+                        ConsoleOutput.WriteRed($"Incremental fetch failed with the saved anchor: {ex.Message}");
+                        Console.WriteLine("Clearing the saved anchor and retrying once with a full revision list.");
+
+                        if (store is ISyncAnchorStore retryAnchorStore)
+                        {
+                            retryAnchorStore.ClearSyncAnchor(anchorKey);
+                        }
+
+                        microsoftUpdateSource = new UpstreamUpdatesSource(upstreamEndpoint, sourceFilter, null)
+                        {
+                            BatchSize = Math.Max(1, options.MetadataBatchSize)
+                        };
+                        microsoftUpdateSource.MetadataCopyProgress += Program.OnPackageCopyProgress;
+                        microsoftUpdateSource.CopyTo(store, cancellationToken.Token);
+                    }
+
+                    if (store is ISyncAnchorStore finalAnchorStore && !string.IsNullOrEmpty(microsoftUpdateSource.NewAnchor))
+                    {
+                        finalAnchorStore.SetSyncAnchor(anchorKey, microsoftUpdateSource.NewAnchor);
+                        Console.WriteLine("Saved upstream sync anchor for the next incremental fetch.");
+                    }
 
                     Console.WriteLine();
                     Console.WriteLine("Done!");
@@ -258,21 +310,38 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
             }
         }
 
-        private static List<Guid> CreateFilterListForCategory<T>(IEnumerable<string> userFilterList, IMetadataStore metadataSource)
+        private static bool HasValues(IEnumerable<string> values)
         {
+            return values != null && values.Any(value => !string.IsNullOrWhiteSpace(value));
+        }
+
+        private static bool StoreIsEmpty(IMetadataStore metadataSource)
+        {
+            return metadataSource.GetPackageIdentities().Count == 0;
+        }
+
+        private static List<Guid> CreateFilterListForCategory<T>(IEnumerable<string> userFilterList, IMetadataStore metadataSource, bool includeAllWhenEmpty)
+        {
+            var userFilters = userFilterList?
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Select(value => value.Trim())
+                .ToList() ?? new List<string>();
+
             List<Guid> filterList;
-            if (userFilterList.Any())
+            if (userFilters.Count > 0)
             {
                 filterList = new List<Guid>();
-                foreach (var guidString in userFilterList)
+                foreach (var guidString in userFilters)
                 {
-                    if (Guid.TryParse(guidString, out Guid guid))
+                    if (!Guid.TryParse(guidString, out Guid guid))
                     {
-                        filterList.Add(guid);
+                        throw new Exception($"Invalid GUID in filter: {guidString}");
                     }
+
+                    filterList.Add(guid);
                 }
             }
-            else
+            else if (includeAllWhenEmpty)
             {
                 filterList = metadataSource.OfType<T>()
                     .Select(update => (update as MicrosoftUpdatePackage).Id.ID)
@@ -280,11 +349,15 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
 
                 if (filterList.Count == 0)
                 {
-                    throw new Exception("No products information available to create a filter");
+                    throw new Exception("No category information available to create a filter. Run pre-fetch first or use --refresh-categories.");
                 }
             }
+            else
+            {
+                filterList = new List<Guid>();
+            }
 
-            return filterList;
+            return filterList.Distinct().ToList();
         }
 
         private static List<int> CreateLanguageFilterFromOptions(FetchPackagesOptions options)
@@ -348,15 +421,47 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
             return languages.Distinct().ToList();
         }
 
+        private static string BuildSyncAnchorKey(MicrosoftUpdate.Source.Endpoint endpoint, UpstreamSourceFilter filter)
+        {
+            var keyData = new
+            {
+                Type = "microsoft-update-revision-list",
+                Endpoint = endpoint.URI,
+                Products = filter.ProductsFilter.OrderBy(value => value).Select(value => value.ToString("D")).ToList(),
+                Classifications = filter.ClassificationsFilter.OrderBy(value => value).Select(value => value.ToString("D")).ToList(),
+                Languages = filter.LanguagesFilter.OrderBy(value => value).ToList()
+            };
+
+            var json = JsonConvert.SerializeObject(keyData);
+            using var sha256 = SHA256.Create();
+            var hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(json));
+            return "sync-anchor:mu:" + Convert.ToHexString(hash).ToLowerInvariant();
+        }
+
         private static UpstreamSourceFilter CreateValidFilterFromOptions(FetchPackagesOptions options, IMetadataStore metadataSource)
         {
+            var hasProductFilter = HasValues(options.ProductsFilter);
+            if (!hasProductFilter && !options.AllowAllProducts)
+            {
+                throw new Exception(
+                    "No --product-filter was provided. A classification-only fetch asks Microsoft Update for that classification across every product and can take hours or create a huge store. " +
+                    "Add --product-filter <PRODUCT_GUID>, or add --allow-all-products if you really want the full catalog.");
+            }
+
+            if (!hasProductFilter && options.AllowAllProducts)
+            {
+                ConsoleOutput.WriteRed("Warning: --allow-all-products selected. This can be extremely slow and large.");
+            }
+
             List<Guid> productFilter = CreateFilterListForCategory<ProductCategory>(
-                options.ProductsFilter, 
-                metadataSource);
+                options.ProductsFilter,
+                metadataSource,
+                includeAllWhenEmpty: true);
 
             List<Guid> classificationFilter = CreateFilterListForCategory<ClassificationCategory>(
                 options.ClassificationsFilter,
-                metadataSource);
+                metadataSource,
+                includeAllWhenEmpty: true);
 
             List<int> languageFilter = CreateLanguageFilterFromOptions(options);
             bool stripUnrequestedLocalizedProperties = languageFilter.Count > 0 && !options.KeepAllLocalizedProperties;

@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
@@ -18,9 +18,23 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
     public class UpstreamUpdatesSource : IMetadataSource
     {
         private readonly UpstreamServerClient _Client;
+        private readonly string _OldAnchor;
         private UpstreamSourceFilter _Filter;
 
         private List<MicrosoftUpdatePackageIdentity> _Identities;
+
+        /// <summary>
+        /// Anchor returned by the upstream server for the last GetRevisionIdList request.
+        /// Persist it only after the retrieved metadata has been written successfully.
+        /// </summary>
+        public string NewAnchor { get; private set; }
+
+        /// <summary>
+        /// Client-side metadata retrieval batch size. This is independent from the
+        /// upstream MaxNumberOfUpdatesPerRequest limit; the client will split again
+        /// if the service reports a smaller limit.
+        /// </summary>
+        public int BatchSize { get; set; } = 100;
 
         /// <summary>
         /// Progress indicator during metadata copy operations
@@ -39,9 +53,21 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// <param name="upstreamEndpoint">Endpoint to get updates from</param>
         /// <param name="filter">Filter to apply when retrieving updates from this source.</param>
         public UpstreamUpdatesSource(Endpoint upstreamEndpoint, UpstreamSourceFilter filter)
+            : this(upstreamEndpoint, filter, null)
+        {
+        }
+
+        /// <summary>
+        /// Create a new MicrosoftUpdate package source using an optional upstream anchor.
+        /// </summary>
+        /// <param name="upstreamEndpoint">Endpoint to get updates from</param>
+        /// <param name="filter">Filter to apply when retrieving updates from this source.</param>
+        /// <param name="oldAnchor">Previously saved WSUS anchor for this exact endpoint/filter.</param>
+        public UpstreamUpdatesSource(Endpoint upstreamEndpoint, UpstreamSourceFilter filter, string oldAnchor)
         {
             _Client = new UpstreamServerClient(upstreamEndpoint);
             _Filter = filter;
+            _OldAnchor = oldAnchor;
         }
 
         private void RetrievePackageIdentities()
@@ -50,8 +76,12 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
             {
                 if (_Identities == null)
                 {
-                    _Identities = _Client.GetUpdateIds(_Filter, out var _).ToList();
+                    _Identities = _Client
+                        .GetUpdateIds(_Filter, out var newAnchor, _OldAnchor)
+                        .Distinct()
+                        .ToList();
                     _Identities.Sort();
+                    NewAnchor = newAnchor;
                 }
             }
         }
@@ -65,9 +95,11 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// <returns>The batched list</returns>
         private static List<List<T>> CreateBatchedListFromFlatList<T>(List<T> flatList, int maxBatchSize)
         {
+            maxBatchSize = Math.Max(1, maxBatchSize);
+
             // Figure out how many batches we have
             var batchCount = flatList.Count / maxBatchSize;
-            // One more batch for the remaininig objects, if any
+            // One more batch for the remaining objects, if any
             batchCount += flatList.Count % maxBatchSize == 0 ? 0 : 1;
 
             List<List<T>> batches = new(batchCount);
@@ -103,29 +135,31 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
                 unavailableUpdates = _Identities;
             }
 
-            if (unavailableUpdates.Count > 0)
+            var progressArgs = new PackageStoreEventArgs() { Total = unavailableUpdates.Count, Current = 0 };
+            MetadataCopyProgress?.Invoke(this, progressArgs);
+
+            if (unavailableUpdates.Count == 0)
             {
-                var progressArgs = new PackageStoreEventArgs() { Total = unavailableUpdates.Count, Current = 0 };
-                var batches = CreateBatchedListFromFlatList(unavailableUpdates, 50);
-                
-                MetadataCopyProgress?.Invoke(this, progressArgs);
-                batches.AsParallel().ForAll(batch =>
+                return;
+            }
+
+            var batches = CreateBatchedListFromFlatList(unavailableUpdates, BatchSize);
+
+            // Keep write operations sequential. SQLite has a single writer and the store also updates
+            // in-memory indexes; firing many concurrent AddPackages calls mostly creates lock contention.
+            foreach (var batch in batches)
+            {
+                if (cancelToken.IsCancellationRequested)
                 {
-                    if (cancelToken.IsCancellationRequested)
-                    {
-                        return;
-                    }
+                    return;
+                }
 
-                    var retrievedPackages = _Client.GetUpdateDataForIds(batch.ToList(), _Filter);
-                    destination.AddPackages(retrievedPackages);
-                    retrievedPackages.ForEach(u => u.ReleaseMetadataBytes());
+                var retrievedPackages = _Client.GetUpdateDataForIds(batch.ToList(), _Filter);
+                destination.AddPackages(retrievedPackages);
+                retrievedPackages.ForEach(u => u.ReleaseMetadataBytes());
 
-                    lock(progressArgs)
-                    {
-                        progressArgs.Current += retrievedPackages.Count;
-                        MetadataCopyProgress?.Invoke(this, progressArgs);
-                    }                    
-                });
+                progressArgs.Current += retrievedPackages.Count;
+                MetadataCopyProgress?.Invoke(this, progressArgs);
             }
         }
 

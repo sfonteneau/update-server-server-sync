@@ -168,14 +168,26 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
         [Option("endpoint-type", Required = false, Default = MicrosoftUpdateEndpoint, HelpText = "The endpoint from which to fetch updates.")]
         public string EndpointType { get; set; }
 
-        [Option("product-filter", Required = false, Separator = '+', HelpText = "Product filter for sync'ing updates")]
+        [Option("product-filter", Required = false, Separator = '+', HelpText = "Product filter for sync'ing updates. Strongly recommended; without it Microsoft Update may return a very large catalog.")]
         public IEnumerable<string> ProductsFilter { get; set; }
+
+        [Option("allow-all-products", Required = false, Default = false, HelpText = "Allow fetch without --product-filter. This can be extremely slow and large.")]
+        public bool AllowAllProducts { get; set; }
 
         [Option("classification-filter", Required = false, Separator = '+', HelpText = "Classification filter for sync'ing updates")]
         public IEnumerable<string> ClassificationsFilter { get; set; }
 
         [Option("language-filter", Required = false, Separator = '+', HelpText = "Language LCIDs or short names to sync. Default: 1033/en. Use all to disable the language filter")]
         public IEnumerable<string> LanguageFilter { get; set; }
+
+        [Option("refresh-categories", Required = false, Default = false, HelpText = "Refresh upstream categories before fetching updates. By default categories are fetched only when missing.")]
+        public bool RefreshCategories { get; set; }
+
+        [Option("ignore-sync-anchor", Required = false, Default = false, HelpText = "Ignore the saved upstream WSUS anchor and force a full revision list query.")]
+        public bool IgnoreSyncAnchor { get; set; }
+
+        [Option("metadata-batch-size", Required = false, Default = 100, HelpText = "Number of update identities retrieved and stored per local batch.")]
+        public int MetadataBatchSize { get; set; }
 
         [Option("keep-all-localized-properties", Required = false, Default = false, HelpText = "Do not strip non-requested LocalizedProperties from stored metadata")]
         public bool KeepAllLocalizedProperties { get; set; }

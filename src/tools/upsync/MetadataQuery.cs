@@ -109,63 +109,25 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
         public static void PrintFilter(UpstreamSourceFilter filter, IMetadataStore metadataSource)
         {
             Console.WriteLine("Filter:");
-            
-            var allClassifications = metadataSource.OfType<ClassificationCategory>();
-            var allProducts = metadataSource.OfType<ProductCategory>();
-
-            bool allClassificationsIncluded = false;
-            if (allClassifications.Count() == filter.ClassificationsFilter.Count)
-            {
-                allClassificationsIncluded = true;
-                foreach (var classificationId in filter.ClassificationsFilter)
-                {
-                    if (!allClassifications.Any(c => c.Id.ID == classificationId))
-                    {
-                        allClassificationsIncluded = false;
-                        break;
-                    }
-                }
-            }
 
             ConsoleOutput.WriteGreen("    Classifications:");
-            if (allClassificationsIncluded)
+            foreach (var classificationId in filter.ClassificationsFilter)
             {
-                ConsoleOutput.WriteGreen($"        all");
-            }
-            else
-            {
-                foreach (var classificationId in filter.ClassificationsFilter)
-                {
-                    ConsoleOutput.WriteGreen($"        {classificationId}");
-                    ConsoleOutput.WriteGreen($"            {allClassifications.FirstOrDefault(c => c.Id.ID == classificationId).Title}");
-                }
+                ConsoleOutput.WriteGreen($"        {classificationId}");
             }
 
             ConsoleOutput.WriteCyan("    Products:");
-            bool allProductsIncluded = false;
-            if (allProducts.Count() == filter.ProductsFilter.Count)
+            foreach (var productId in filter.ProductsFilter)
             {
-                allProductsIncluded = true;
-                foreach (var productId in filter.ProductsFilter)
-                {
-                    if (!allProducts.Any(c => c.Id.ID == productId))
-                    {
-                        allProductsIncluded = false;
-                        break;
-                    }
-                }
+                ConsoleOutput.WriteCyan($"        {productId}");
             }
 
-            if (allProductsIncluded)
+            if (filter.LanguagesFilter.Count > 0)
             {
-                Console.WriteLine("        all");
-            }
-            else
-            {
-                foreach (var productId in filter.ProductsFilter)
+                Console.WriteLine("    Languages:");
+                foreach (var languageId in filter.LanguagesFilter)
                 {
-                    ConsoleOutput.WriteCyan($"        {productId}");
-                    ConsoleOutput.WriteCyan($"            {allProducts.FirstOrDefault(c => c.Id.ID == productId).Title}");
+                    Console.WriteLine($"        {languageId}");
                 }
             }
         }
