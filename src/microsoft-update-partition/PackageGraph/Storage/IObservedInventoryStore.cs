@@ -179,7 +179,16 @@ namespace Microsoft.PackageGraph.Storage
         DetectoidCategory = 1,
 
         /// <summary>The concrete product directly declares the detectoid as a prerequisite.</summary>
-        ProductPrerequisite = 2
+        ProductPrerequisite = 2,
+
+        /// <summary>The detectoid declares a product family/company category whose nearest descendant is a concrete product.</summary>
+        CategoryHierarchy = 4,
+
+        /// <summary>The concrete product reaches the detectoid through one or more intermediate detectoids.</summary>
+        TransitiveProductPrerequisite = 8,
+
+        /// <summary>WUA directly reported a product-category node as installed/applicable.</summary>
+        ObservedProductCategory = 16
     }
 
     /// <summary>Maps one detectoid GUID to one concrete Microsoft Update product category.</summary>

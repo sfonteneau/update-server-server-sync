@@ -23,9 +23,11 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                 return;
             }
 
-            var detectoidIdentities = MetadataSource.GetDetectoidIdentities(
+            // WUA can report both detectoids and product-category nodes in
+            // InstalledNonLeafUpdateIDs. Both are useful product detectors.
+            var detectorIdentities = MetadataSource.GetObservedDetectorIdentities(
                 parameters.InstalledNonLeafUpdateIDs ?? Array.Empty<int>());
-            var detectoids = detectoidIdentities.Values
+            var detectoids = detectorIdentities.Values
                 .Select(identity => new ObservedDetectoidIdentity(
                     identity.ID,
                     identity.Revision))

@@ -117,13 +117,13 @@ WHERE key IN (
         public IReadOnlyDictionary<int, MicrosoftUpdatePackageIdentity> GetPackageIdentities(
             IEnumerable<int> revisionIds)
         {
-            return ReadPackageIdentities(revisionIds, detectoidsOnly: false);
+            return ReadPackageIdentities(revisionIds, observedDetectorsOnly: false);
         }
 
-        public IReadOnlyDictionary<int, MicrosoftUpdatePackageIdentity> GetDetectoidIdentities(
+        public IReadOnlyDictionary<int, MicrosoftUpdatePackageIdentity> GetObservedDetectorIdentities(
             IEnumerable<int> revisionIds)
         {
-            return ReadPackageIdentities(revisionIds, detectoidsOnly: true);
+            return ReadPackageIdentities(revisionIds, observedDetectorsOnly: true);
         }
 
         public bool TryGetPackageIdentity(int revisionId, out MicrosoftUpdatePackageIdentity identity)
@@ -966,7 +966,7 @@ WHERE pfm.package_index = $packageIndex
 
         private IReadOnlyDictionary<int, MicrosoftUpdatePackageIdentity> ReadPackageIdentities(
             IEnumerable<int> revisionIds,
-            bool detectoidsOnly)
+            bool observedDetectorsOnly)
         {
             ThrowIfDisposed();
             var requested = (revisionIds ?? Array.Empty<int>())
@@ -995,13 +995,18 @@ WHERE pfm.package_index = $packageIndex
 SELECT package_index, identity
 FROM packages
 WHERE published = 1
-  {(detectoidsOnly ? "AND package_type = $detectoidType" : string.Empty)}
+  {(observedDetectorsOnly
+      ? "AND package_type IN ($detectoidType, $productType)"
+      : string.Empty)}
   AND package_index IN ({string.Join(", ", parameterNames)});";
-                if (detectoidsOnly)
+                if (observedDetectorsOnly)
                 {
                     command.Parameters.AddWithValue(
                         "$detectoidType",
                         (int)StoredPackageType.MicrosoftUpdateDetectoid);
+                    command.Parameters.AddWithValue(
+                        "$productType",
+                        (int)StoredPackageType.MicrosoftUpdateProduct);
                 }
 
                 using var reader = command.ExecuteReader();

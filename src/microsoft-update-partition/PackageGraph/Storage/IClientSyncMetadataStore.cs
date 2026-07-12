@@ -76,8 +76,11 @@ namespace Microsoft.PackageGraph.Storage
         IReadOnlyDictionary<int, MicrosoftUpdatePackageIdentity> GetPackageIdentities(
             IEnumerable<int> revisionIds);
 
-        /// <summary>Resolves published local revision IDs only when they are detectoids.</summary>
-        IReadOnlyDictionary<int, MicrosoftUpdatePackageIdentity> GetDetectoidIdentities(
+        /// <summary>
+        /// Resolves published local revision IDs that can describe installed products:
+        /// detectoids and Microsoft Update product-category nodes.
+        /// </summary>
+        IReadOnlyDictionary<int, MicrosoftUpdatePackageIdentity> GetObservedDetectorIdentities(
             IEnumerable<int> revisionIds);
 
         /// <summary>Resolves one published local revision ID to its global identity.</summary>

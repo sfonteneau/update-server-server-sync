@@ -544,9 +544,26 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
             var revisionIdentities = driverSource.GetPackageIdentities();
             if (string.IsNullOrWhiteSpace(driverSource.NewAnchor))
             {
-                throw new InvalidOperationException(
-                    "The upstream server returned a driver revision list without a new anchor. " +
-                    "The per-identifier state cannot be advanced safely.");
+                ConsoleOutput.WriteRed(
+                    $"Warning: Microsoft returned {revisionIdentities.Count} matching driver revision(s) " +
+                    $"through {driverSource.DriverRequestCount} request(s), but " +
+                    $"{driverSource.DriverResponsesWithoutAnchor} response(s) did not contain an anchor. " +
+                    "The revisions will be imported, but the stable per-identifier anchors will not be advanced.");
+
+                var alreadyStored = revisionIdentities.Count(store.ContainsPackage);
+                driverSource.CopyPackagesTo(
+                    store,
+                    revisionIdentities,
+                    cancellationToken);
+                var storedAfterImport = revisionIdentities.Count(store.ContainsPackage);
+
+                Console.WriteLine(
+                    $"Anchorless driver import complete: {storedAfterImport}/{revisionIdentities.Count} revision(s) " +
+                    $"are present locally ({Math.Max(0, storedAfterImport - alreadyStored)} newly stored). " +
+                    (string.IsNullOrWhiteSpace(stableAnchor)
+                        ? "The next scheduled run will request the filtered driver list again; existing metadata will be skipped."
+                        : "The previous stable anchor was preserved and will be retried on the next scheduled run."));
+                return;
             }
 
             driverStateStore.CreateDriverSyncCheckpoint(

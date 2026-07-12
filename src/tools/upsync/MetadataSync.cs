@@ -138,8 +138,18 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
             Console.WriteLine(
                 $"Mapped {result.MappingCount} detectoid/product pair(s) from " +
                 $"{result.DetectoidCount} detectoid(s) and {result.ConcreteProductCount} concrete product(s). " +
-                $"Sources: detectoid categories={result.DetectoidCategoryMappingCount}, " +
-                $"product prerequisites={result.ProductPrerequisiteMappingCount}.");
+                $"Sources: direct categories={result.DetectoidCategoryMappingCount}, " +
+                $"direct prerequisites={result.ProductPrerequisiteMappingCount}, " +
+                $"category hierarchy={result.CategoryHierarchyMappingCount}, " +
+                $"transitive prerequisites={result.TransitiveProductPrerequisiteMappingCount}, " +
+                $"direct product observations={result.ObservedProductCategoryMappingCount}.");
+
+            if (result.AmbiguousDetectoidCount > 0)
+            {
+                Console.WriteLine(
+                    $"Ignored {result.AmbiguousDetectoidCount} broad detectoid(s) that resolved to more than " +
+                    "16 equally-near products.");
+            }
 
             if (result.SkippedPackageCount > 0)
             {
@@ -236,9 +246,21 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
                 }
 
                 var initialMapStatus = observedInventoryStore.GetDetectoidProductMapStatus();
+                var mapNeedsAutomaticRepair =
+                    initialMapStatus.MappingCount == 0
+                    && initialMapStatus.ActiveUnmappedDetectoidCount > 0;
                 if (!mapWasRebuilt
-                    && (options.RebuildProductMap || initialMapStatus.RebuiltAt == null))
+                    && (options.RebuildProductMap
+                        || initialMapStatus.RebuiltAt == null
+                        || mapNeedsAutomaticRepair))
                 {
+                    if (mapNeedsAutomaticRepair && !options.RebuildProductMap)
+                    {
+                        Console.WriteLine(
+                            "The cached detectoid-to-product map is empty while client detectoids are present; " +
+                            "rebuilding it with prerequisite/category graph traversal.");
+                    }
+
                     RebuildObservedProductMap(store);
                 }
 

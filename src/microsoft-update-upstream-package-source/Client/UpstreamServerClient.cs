@@ -272,6 +272,8 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
             DriverUpdateFilter driverFilter,
             out string newAnchor,
             out int driverSetCount,
+            out int requestCount,
+            out int responsesWithoutAnchor,
             string oldAnchor = null)
         {
             if (driverFilter == null)
@@ -310,6 +312,9 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
             var driverSets = new HashSet<Guid>();
             string synchronizationAnchor = null;
             var requestAnchor = oldAnchor;
+            var responseCount = 0;
+            var missingAnchorCount = 0;
+            var anchorsAreConsistent = true;
 
             // GetDriverIdList can require several SOAP calls because Microsoft
             // limits the number of computer and PnP IDs per request. The first
@@ -364,15 +369,32 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
                     throw new Exception("Failed to get driver revision ID list");
                 }
 
-                if (string.IsNullOrWhiteSpace(result.Anchor))
+                responseCount++;
+                var responseAnchor = string.IsNullOrWhiteSpace(result.Anchor)
+                    ? null
+                    : result.Anchor.Trim();
+                if (responseAnchor == null)
                 {
-                    throw new Exception("The upstream server returned a driver list without an anchor");
+                    // Microsoft Update can return a usable full driver revision
+                    // list without an anchor. Importing that list is safe; only
+                    // promoting per-identifier delta state would be unsafe.
+                    missingAnchorCount++;
+                    anchorsAreConsistent = false;
                 }
-
-                if (synchronizationAnchor == null)
+                else if (synchronizationAnchor == null)
                 {
-                    synchronizationAnchor = result.Anchor;
-                    requestAnchor = synchronizationAnchor;
+                    synchronizationAnchor = responseAnchor;
+                    if (missingAnchorCount == 0)
+                    {
+                        requestAnchor = synchronizationAnchor;
+                    }
+                }
+                else if (!string.Equals(
+                    synchronizationAnchor,
+                    responseAnchor,
+                    StringComparison.Ordinal))
+                {
+                    anchorsAreConsistent = false;
                 }
 
                 foreach (var rawId in result.NewRevisions ?? Array.Empty<UpdateIdentity>())
@@ -388,8 +410,15 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
                 }
             }
 
-            newAnchor = synchronizationAnchor;
+            // A cohort anchor is promotable only when every batched response
+            // supplied the same non-empty anchor. Otherwise the caller imports
+            // the returned revisions but leaves the previous stable state intact.
+            newAnchor = missingAnchorCount == 0 && anchorsAreConsistent
+                ? synchronizationAnchor
+                : null;
             driverSetCount = driverSets.Count;
+            requestCount = responseCount;
+            responsesWithoutAnchor = missingAnchorCount;
             progress.CurrentTask = MetadataQueryStage.GetRevisionIdsEnd;
             MetadataQueryProgress?.Invoke(this, progress);
             return revisions;

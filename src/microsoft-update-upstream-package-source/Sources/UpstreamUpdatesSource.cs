@@ -36,6 +36,12 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// </summary>
         public int DriverSetCount { get; private set; }
 
+        /// <summary>Gets the number of GetDriverIdList SOAP requests used for the current identifier cohort.</summary>
+        public int DriverRequestCount { get; private set; }
+
+        /// <summary>Gets how many GetDriverIdList responses omitted the optional synchronization anchor.</summary>
+        public int DriverResponsesWithoutAnchor { get; private set; }
+
         /// <summary>
         /// Client-side metadata retrieval batch size. This is independent from the
         /// upstream MaxNumberOfUpdatesPerRequest limit; the client will split again
@@ -114,8 +120,12 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
                             _DriverFilter,
                             out newAnchor,
                             out var driverSetCount,
+                            out var driverRequestCount,
+                            out var responsesWithoutAnchor,
                             _OldAnchor);
                         DriverSetCount = driverSetCount;
+                        DriverRequestCount = driverRequestCount;
+                        DriverResponsesWithoutAnchor = responsesWithoutAnchor;
                     }
 
                     _Identities = identities

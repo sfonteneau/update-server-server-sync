@@ -213,7 +213,9 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                     updateID.RevisionNumber);
                 if (!MetadataSource.TryGetPackage(identity, out var package))
                 {
-                    throw new FaultException($"Update identity not found: {identity}");
+                    System.Diagnostics.Trace.TraceWarning(
+                        $"Ignoring a stale client update identity that is not present in the published catalog: {identity}");
+                    continue;
                 }
 
                 requestedUpdates.Add(package);
@@ -309,7 +311,9 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
             {
                 if (!MetadataSource.TryGetPackage(requestedRevision, out var package))
                 {
-                    throw new FaultException($"Revision ID not found: {requestedRevision}");
+                    System.Diagnostics.Trace.TraceWarning(
+                        $"Ignoring stale client revision ID {requestedRevision}; it is not present in the published catalog.");
+                    continue;
                 }
 
                 requestedUpdates.Add(package);
@@ -441,17 +445,34 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         private List<MicrosoftUpdatePackageIdentity> GetUpdateIdentitiesFromClientIndexes(
             int[] clientIndexes)
         {
-            var requested = clientIndexes ?? Array.Empty<int>();
+            var requested = (clientIndexes ?? Array.Empty<int>())
+                .Distinct()
+                .ToArray();
             var identitiesByRevision = MetadataSource.GetPackageIdentities(requested);
             var identities = new List<MicrosoftUpdatePackageIdentity>(requested.Length);
+            var missingRevisionIds = new List<int>();
             foreach (var revisionId in requested)
             {
                 if (!identitiesByRevision.TryGetValue(revisionId, out var identity))
                 {
-                    throw new FaultException($"Revision ID not found: {revisionId}");
+                    // WUA can retain local revision IDs from a previous database,
+                    // server installation or catalog generation. They are local
+                    // server IDs, so failing the entire scan would prevent WUA
+                    // from learning the current root/detectoid catalog.
+                    missingRevisionIds.Add(revisionId);
+                    continue;
                 }
 
                 identities.Add(identity);
+            }
+
+            if (missingRevisionIds.Count > 0)
+            {
+                var sample = string.Join(", ", missingRevisionIds.Take(20));
+                System.Diagnostics.Trace.TraceWarning(
+                    $"Ignored {missingRevisionIds.Count} stale client revision ID(s) that are not present " +
+                    $"in the published catalog: {sample}" +
+                    (missingRevisionIds.Count > 20 ? ", ..." : string.Empty));
             }
 
             return identities;
