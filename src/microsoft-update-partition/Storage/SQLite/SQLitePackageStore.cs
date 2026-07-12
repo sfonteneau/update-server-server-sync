@@ -1078,7 +1078,7 @@ WHERE NOT EXISTS (
 );";
                     cleanupCommand.Parameters.AddWithValue(
                         "$detectoidType",
-                        (int)StoredPackageType.MicrosoftUpdateDetectoid);
+                        (int)Microsoft.PackageGraph.MicrosoftUpdate.StoredPackageType.MicrosoftUpdateDetectoid);
                     cleanupCommand.ExecuteNonQuery();
                 }
 
