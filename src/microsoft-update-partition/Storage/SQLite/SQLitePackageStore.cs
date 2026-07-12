@@ -1071,8 +1071,10 @@ ORDER BY last_seen DESC, computer_id;";
 DELETE FROM observed_detectoids
 WHERE NOT EXISTS (
     SELECT 1
-    FROM packages AS package
-    WHERE package.update_id = observed_detectoids.update_id
+    FROM client_sync_packages AS sync_package
+    INNER JOIN packages AS package
+        ON package.package_index = sync_package.package_index
+    WHERE sync_package.update_id = observed_detectoids.update_id
       AND package.package_type = $detectoidType
       AND package.published = 1
 );";
