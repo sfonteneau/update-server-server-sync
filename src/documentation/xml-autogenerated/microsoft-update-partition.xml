@@ -775,6 +775,19 @@
             Software or driver updates have one or more corresponding categories: "SQL Server [x]", "Visual Studio [x]", "Windows 1903 and later", etc.
             </summary>
         </member>
+        <member name="T:Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Content.IMicrosoftUpdateFileLocationLookup">
+            <summary>
+            Optional fast lookup interface for metadata stores that can resolve Microsoft Update
+            content files directly by SHA1 digest without enumerating every package.
+            </summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Content.IMicrosoftUpdateFileLocationLookup.FindFilesBySha1(System.Collections.Generic.IEnumerable{System.Byte[]})">
+            <summary>
+            Finds update content files by SHA1 digest bytes.
+            </summary>
+            <param name="sha1Digests">Requested SHA1 digests.</param>
+            <returns>Matching update files, including their Microsoft Update URLs when available.</returns>
+        </member>
         <member name="T:Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Content.UpdateFile">
             <summary>
             Represents a content file for an update.
@@ -1747,6 +1760,12 @@
             </summary>
             <returns>XML stream, UTF8 encoded</returns>
         </member>
+        <member name="M:Microsoft.PackageGraph.MicrosoftUpdate.Metadata.MicrosoftUpdatePackage.TryGetCompressedMetadataBytes(System.Byte[]@)">
+            <summary>
+            Returns the compressed metadata bytes exactly as they were kept in memory after upstream retrieval.
+            The bytes are GZip-compressed XML and can be stored directly without expanding and recompressing.
+            </summary>
+        </member>
         <member name="M:Microsoft.PackageGraph.MicrosoftUpdate.Metadata.MicrosoftUpdatePackage.MatchTitle(System.String[])">
             <summary>
             Matches keywords in the title of the update
@@ -2327,6 +2346,115 @@
             The count of content files left to be downloaded in the current download operation
             </summary>
         </member>
+        <member name="T:Microsoft.PackageGraph.Storage.DriverSyncIdentifierType">
+            <summary>Identifies the kind of hardware identifier used by GetDriverIdList.</summary>
+        </member>
+        <member name="F:Microsoft.PackageGraph.Storage.DriverSyncIdentifierType.PnpHardwareId">
+            <summary>A Plug and Play hardware or compatible identifier.</summary>
+        </member>
+        <member name="F:Microsoft.PackageGraph.Storage.DriverSyncIdentifierType.ComputerHardwareId">
+            <summary>An OEM computer hardware identifier.</summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.DriverSyncIdentifier">
+            <summary>
+            One normalized hardware identifier whose upstream driver anchor is tracked
+            independently from the other identifiers observed in the fleet.
+            </summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DriverSyncIdentifier.Type">
+            <summary>Gets the identifier kind.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DriverSyncIdentifier.Value">
+            <summary>Gets the normalized identifier value.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.DriverSyncIdentifier.#ctor(Microsoft.PackageGraph.Storage.DriverSyncIdentifierType,System.String)">
+            <summary>Creates a normalized driver synchronization identifier.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.DriverSyncIdentifier.Pnp(System.String)">
+            <summary>Creates a PnP identifier.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.DriverSyncIdentifier.Computer(System.Guid)">
+            <summary>Creates a computer hardware identifier.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.DriverSyncIdentifier.GetComputerId">
+            <summary>Parses the value as a computer hardware identifier.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.DriverSyncIdentifier.Equals(Microsoft.PackageGraph.Storage.DriverSyncIdentifier)">
+            <inheritdoc />
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.DriverSyncIdentifier.Equals(System.Object)">
+            <inheritdoc />
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.DriverSyncIdentifier.GetHashCode">
+            <inheritdoc />
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.DriverSyncIdentifier.ToString">
+            <inheritdoc />
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.DriverSyncIdentifierState">
+            <summary>Describes the last successful upstream anchor for one identifier.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DriverSyncIdentifierState.ScopeKey">
+            <summary>Gets the synchronization scope key.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DriverSyncIdentifierState.Identifier">
+            <summary>Gets the hardware identifier.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DriverSyncIdentifierState.Anchor">
+            <summary>Gets the opaque upstream anchor.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DriverSyncIdentifierState.UpdatedAt">
+            <summary>Gets when the anchor was last promoted.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.DriverSyncIdentifierState.#ctor(System.String,Microsoft.PackageGraph.Storage.DriverSyncIdentifier,System.String,System.DateTimeOffset)">
+            <summary>Creates an identifier state.</summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.DriverSyncCheckpointInfo">
+            <summary>
+            Describes a resumable GetDriverIdList result and the identifiers whose
+            anchors will be promoted when all returned revision metadata is durable.
+            </summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DriverSyncCheckpointInfo.ScopeKey">
+            <summary>Gets the synchronization scope key.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DriverSyncCheckpointInfo.Checkpoint">
+            <summary>Gets the generic metadata checkpoint information.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DriverSyncCheckpointInfo.Identifiers">
+            <summary>Gets the identifiers covered by the upstream request.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.DriverSyncCheckpointInfo.#ctor(System.String,Microsoft.PackageGraph.Storage.SyncCheckpointInfo,System.Collections.Generic.IReadOnlyList{Microsoft.PackageGraph.Storage.DriverSyncIdentifier})">
+            <summary>Creates driver checkpoint information.</summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.IDriverSyncStateStore">
+            <summary>
+            Optional metadata-store capability used by observed-driver synchronization.
+            Anchors are stored per hardware identifier, while a grouped network request
+            uses one resumable metadata checkpoint.
+            </summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.IDriverSyncStateStore.GetDriverSyncIdentifierStates(System.String,System.Collections.Generic.IEnumerable{Microsoft.PackageGraph.Storage.DriverSyncIdentifier})">
+            <summary>Gets saved anchors for the supplied identifiers in one exact scope.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.IDriverSyncStateStore.GetDriverSyncCheckpoints(System.String)">
+            <summary>Gets unfinished driver checkpoints for one exact scope.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.IDriverSyncStateStore.CreateDriverSyncCheckpoint(System.String,System.String,System.String,System.String,System.Collections.Generic.IReadOnlyList{Microsoft.PackageGraph.ObjectModel.IPackageIdentity},System.Collections.Generic.IReadOnlyCollection{Microsoft.PackageGraph.Storage.DriverSyncIdentifier})">
+            <summary>
+            Creates a metadata checkpoint and records the identifiers that will
+            receive AnchorTo when the checkpoint completes.
+            </summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.IDriverSyncStateStore.CompleteDriverSyncCheckpoint(System.String)">
+            <summary>
+            Atomically promotes AnchorTo to every checkpoint identifier and removes
+            the completed checkpoint. Throws while metadata items remain pending.
+            </summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.IDriverSyncStateStore.ClearDriverSyncCheckpoint(System.String)">
+            <summary>Discards one unfinished driver checkpoint without changing stable anchors.</summary>
+        </member>
         <member name="T:Microsoft.PackageGraph.Storage.IMetadataFilter">
             <summary>
             Interface for filtering packages from a <see cref="T:Microsoft.PackageGraph.Storage.IMetadataSource"/> or for selectively quering packages from a <see cref="T:Microsoft.PackageGraph.Storage.IMetadataSource"/>
@@ -2569,6 +2697,288 @@
             Progress reporting for a long-running reindexing operation.
             </summary>
         </member>
+        <member name="T:Microsoft.PackageGraph.Storage.ObservedDetectoidIdentity">
+            <summary>
+            Identifies a detectoid revision reported as installed/applicable by a
+            Windows Update client.
+            </summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedDetectoidIdentity.UpdateId">
+            <summary>Gets the global Microsoft Update identifier.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedDetectoidIdentity.RevisionNumber">
+            <summary>Gets the observed revision number.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.ObservedDetectoidIdentity.#ctor(System.Guid,System.Int32)">
+            <summary>Creates a detectoid identity.</summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.ObservedInventoryBatch">
+            <summary>
+            A set of observations collected from one SyncUpdates request. No client,
+            machine or device provenance is retained.
+            </summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedInventoryBatch.ObservedAt">
+            <summary>Gets when the request was observed.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedInventoryBatch.Detectoids">
+            <summary>Gets detectoids reported as installed/applicable.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedInventoryBatch.PnpHardwareIds">
+            <summary>Gets PnP hardware identifiers reported by the client.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedInventoryBatch.CompatibleIds">
+            <summary>Gets compatible identifiers reported by the client.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedInventoryBatch.ComputerIds">
+            <summary>Gets computer hardware identifiers reported by the client.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedInventoryBatch.IsEmpty">
+            <summary>Gets whether the batch contains no usable observations.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.ObservedInventoryBatch.#ctor(System.DateTimeOffset,System.Collections.Generic.IEnumerable{Microsoft.PackageGraph.Storage.ObservedDetectoidIdentity},System.Collections.Generic.IEnumerable{System.String},System.Collections.Generic.IEnumerable{System.String},System.Collections.Generic.IEnumerable{System.Guid})">
+            <summary>Creates an observed inventory batch.</summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.ObservedDetectoidObservation">
+            <summary>Describes one observed detectoid revision.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedDetectoidObservation.UpdateId">
+            <summary>Gets the detectoid identifier.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedDetectoidObservation.RevisionNumber">
+            <summary>Gets the revision number.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedDetectoidObservation.FirstSeen">
+            <summary>Gets when the detectoid was first observed.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedDetectoidObservation.LastSeen">
+            <summary>Gets when the detectoid was last observed.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedDetectoidObservation.ObservationCount">
+            <summary>Gets the number of requests in which it was observed.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.ObservedDetectoidObservation.#ctor(System.Guid,System.Int32,System.DateTimeOffset,System.DateTimeOffset,System.Int64)">
+            <summary>Creates an observed detectoid value.</summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.ObservedIdentifierObservation">
+            <summary>Describes one observed string identifier.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedIdentifierObservation.Identifier">
+            <summary>Gets the normalized identifier.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedIdentifierObservation.FirstSeen">
+            <summary>Gets when the identifier was first observed.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedIdentifierObservation.LastSeen">
+            <summary>Gets when the identifier was last observed.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedIdentifierObservation.ObservationCount">
+            <summary>Gets the number of requests in which it was observed.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.ObservedIdentifierObservation.#ctor(System.String,System.DateTimeOffset,System.DateTimeOffset,System.Int64)">
+            <summary>Creates an observed identifier value.</summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.ObservedComputerIdObservation">
+            <summary>Describes one observed computer hardware identifier.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedComputerIdObservation.ComputerId">
+            <summary>Gets the computer hardware identifier.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedComputerIdObservation.FirstSeen">
+            <summary>Gets when the identifier was first observed.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedComputerIdObservation.LastSeen">
+            <summary>Gets when the identifier was last observed.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedComputerIdObservation.ObservationCount">
+            <summary>Gets the number of requests in which it was observed.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.ObservedComputerIdObservation.#ctor(System.Guid,System.DateTimeOffset,System.DateTimeOffset,System.Int64)">
+            <summary>Creates an observed computer identifier value.</summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.DetectoidProductMappingSource">
+            <summary>
+            Indicates how a detectoid-to-product mapping was derived from the cached
+            Microsoft Update category metadata.
+            </summary>
+        </member>
+        <member name="F:Microsoft.PackageGraph.Storage.DetectoidProductMappingSource.None">
+            <summary>No mapping source.</summary>
+        </member>
+        <member name="F:Microsoft.PackageGraph.Storage.DetectoidProductMappingSource.DetectoidCategory">
+            <summary>The detectoid directly declares the product as a category.</summary>
+        </member>
+        <member name="F:Microsoft.PackageGraph.Storage.DetectoidProductMappingSource.ProductPrerequisite">
+            <summary>The concrete product directly declares the detectoid as a prerequisite.</summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.DetectoidProductMapping">
+            <summary>Maps one detectoid GUID to one concrete Microsoft Update product category.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DetectoidProductMapping.DetectoidUpdateId">
+            <summary>Gets the detectoid GUID.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DetectoidProductMapping.ProductCategoryId">
+            <summary>Gets the concrete product category GUID.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DetectoidProductMapping.Source">
+            <summary>Gets how the mapping was discovered.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.DetectoidProductMapping.#ctor(System.Guid,System.Guid,Microsoft.PackageGraph.Storage.DetectoidProductMappingSource)">
+            <summary>Creates a detectoid-to-product mapping.</summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.ObservedProductCategory">
+            <summary>Describes a product category resolved from recent detectoid observations.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedProductCategory.ProductCategoryId">
+            <summary>Gets the concrete product category GUID.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedProductCategory.LastSeen">
+            <summary>Gets the most recent contributing detectoid observation.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedProductCategory.DetectoidCount">
+            <summary>Gets the number of distinct observed detectoids mapped to this product.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedProductCategory.ObservationCount">
+            <summary>Gets the sum of contributing detectoid observation counters.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.ObservedProductCategory.#ctor(System.Guid,System.DateTimeOffset,System.Int64,System.Int64)">
+            <summary>Creates a resolved observed product.</summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.DetectoidProductMapStatus">
+            <summary>Summarizes the cached detectoid-to-product map.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DetectoidProductMapStatus.MappingCount">
+            <summary>Gets the number of mapping pairs.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DetectoidProductMapStatus.MappedDetectoidCount">
+            <summary>Gets the number of distinct mapped detectoids.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DetectoidProductMapStatus.ProductCount">
+            <summary>Gets the number of distinct mapped products.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DetectoidProductMapStatus.ActiveMappedDetectoidCount">
+            <summary>Gets the number of active observed detectoids that have at least one product mapping.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DetectoidProductMapStatus.ActiveUnmappedDetectoidCount">
+            <summary>Gets the number of active observed detectoids that have no product mapping.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.DetectoidProductMapStatus.RebuiltAt">
+            <summary>Gets when the map was last rebuilt.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.DetectoidProductMapStatus.#ctor(System.Int64,System.Int64,System.Int64,System.Int64,System.Int64,System.Nullable{System.DateTimeOffset})">
+            <summary>Creates mapping status information.</summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.ObservedInventoryKindStatus">
+            <summary>Summarizes observations for one kind of value.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedInventoryKindStatus.TotalCount">
+            <summary>Gets the total number of stored values.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedInventoryKindStatus.SelectedCount">
+            <summary>Gets the number selected by the active time window.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedInventoryKindStatus.FirstSeen">
+            <summary>Gets the earliest stored observation timestamp.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedInventoryKindStatus.LastSeen">
+            <summary>Gets the latest stored observation timestamp.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.ObservedInventoryKindStatus.#ctor(System.Int64,System.Int64,System.Nullable{System.DateTimeOffset},System.Nullable{System.DateTimeOffset})">
+            <summary>Creates a kind status value.</summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.ObservedInventoryStatus">
+            <summary>Summarizes the observed inventory store.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedInventoryStatus.SeenSince">
+            <summary>Gets the active lower timestamp bound.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedInventoryStatus.Detectoids">
+            <summary>Gets detectoid status.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedInventoryStatus.PnpHardwareIds">
+            <summary>Gets PnP hardware identifier status.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedInventoryStatus.CompatibleIds">
+            <summary>Gets compatible identifier status.</summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.ObservedInventoryStatus.ComputerIds">
+            <summary>Gets computer hardware identifier status.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.ObservedInventoryStatus.#ctor(System.Nullable{System.DateTimeOffset},Microsoft.PackageGraph.Storage.ObservedInventoryKindStatus,Microsoft.PackageGraph.Storage.ObservedInventoryKindStatus,Microsoft.PackageGraph.Storage.ObservedInventoryKindStatus,Microsoft.PackageGraph.Storage.ObservedInventoryKindStatus)">
+            <summary>Creates observed inventory status.</summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.IObservedInventoryStore">
+            <summary>
+            Optional capability implemented by a metadata store that records the
+            fleet-wide union of product detectoids and hardware identifiers observed
+            during Windows Update client scans.
+            </summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.IObservedInventoryStore.RecordObservedInventory(Microsoft.PackageGraph.Storage.ObservedInventoryBatch)">
+            <summary>Records one request's observations.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.IObservedInventoryStore.GetObservedDetectoids(System.Nullable{System.DateTimeOffset})">
+            <summary>Gets observed detectoids.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.IObservedInventoryStore.GetObservedPnpHardwareIds(System.Nullable{System.DateTimeOffset})">
+            <summary>Gets observed PnP hardware identifiers.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.IObservedInventoryStore.GetObservedCompatibleIds(System.Nullable{System.DateTimeOffset})">
+            <summary>Gets observed compatible identifiers.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.IObservedInventoryStore.GetObservedComputerIds(System.Nullable{System.DateTimeOffset})">
+            <summary>Gets observed computer hardware identifiers.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.IObservedInventoryStore.GetObservedInventoryStatus(System.Nullable{System.DateTimeOffset})">
+            <summary>Gets observed inventory status.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.IObservedInventoryStore.ReplaceDetectoidProductMappings(System.Collections.Generic.IEnumerable{Microsoft.PackageGraph.Storage.DetectoidProductMapping},System.DateTimeOffset)">
+            <summary>Replaces the derived detectoid-to-product map atomically.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.IObservedInventoryStore.GetObservedProductCategories(System.Nullable{System.DateTimeOffset})">
+            <summary>Gets concrete products resolved from observed detectoids.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.IObservedInventoryStore.GetDetectoidProductMapStatus(System.Nullable{System.DateTimeOffset})">
+            <summary>Gets status for the derived detectoid-to-product map.</summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.IObservedInventoryStore.PruneObservedInventory(System.DateTimeOffset)">
+            <summary>Deletes observations older than the supplied timestamp.</summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.ISyncAnchorStore">
+            <summary>
+            Optional capability implemented by metadata stores that can persist upstream
+            synchronization anchors. Anchors are opaque strings returned by WSUS
+            GetRevisionIdList and must be scoped by endpoint and filter.
+            </summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.SyncCheckpointInfo">
+            <summary>
+            Describes an unfinished upstream metadata synchronization.
+            The upstream anchor in <see cref="P:Microsoft.PackageGraph.Storage.SyncCheckpointInfo.AnchorTo"/> must not become the active
+            anchor until every checkpoint item has been stored successfully.
+            </summary>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.ISyncCheckpointStore">
+            <summary>
+            Optional capability implemented by metadata stores that can checkpoint a
+            WSUS GetRevisionIdList result locally. Package rows may be committed batch
+            by batch, while the new WSUS anchor is promoted atomically only after all
+            revision identities in the checkpoint are complete.
+            </summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.ISyncCheckpointStore.ReconcileSyncCheckpoint(System.String)">
+            <summary>
+            Marks checkpoint items complete when their package row is already in
+            the store. This repairs the safe crash window between package commit
+            and checkpoint-item commit.
+            </summary>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.ISyncCheckpointStore.CompleteSyncCheckpoint(System.String)">
+            <summary>
+            Atomically promotes the checkpoint's AnchorTo value to the active
+            anchor and removes the completed checkpoint. Throws if items remain.
+            </summary>
+        </member>
         <member name="T:Microsoft.PackageGraph.Storage.Azure.BlobContentStore">
             <summary>
             Implementation of <see cref="T:Microsoft.PackageGraph.Storage.IContentStore"/> that downloads and stores update content in Azure Blob Storage
@@ -2809,13 +3219,16 @@
             <inheritdoc cref="M:Microsoft.PackageGraph.Storage.IContentStore.Get(Microsoft.PackageGraph.ObjectModel.IContentFileDigest)"/>
         </member>
         <member name="T:Microsoft.PackageGraph.Storage.Local.PackageStore">
-            <summary>
-            Creates an instance of <see cref="T:Microsoft.PackageGraph.Storage.IMetadataStore"/> that stores update metadata locally in a specified directory.
-            </summary>
+             <summary>
+             Creates an instance of <see cref="T:Microsoft.PackageGraph.Storage.IMetadataStore"/> that stores update metadata locally in a specified directory.
+            
+             The default local store is SQLite-backed and writes store/metadata.sqlite. Legacy zip-delta
+             stores are migrated automatically on first open, then moved aside to a backup directory.
+             </summary>
         </member>
         <member name="M:Microsoft.PackageGraph.Storage.Local.PackageStore.Open(System.String)">
             <summary>
-            Opens an exiting IMetadataStore from the specified directory.
+            Opens an existing IMetadataStore from the specified directory.
             </summary>
             <param name="path">Path to the directory containing the IMetadataStore to open.</param>
             <returns>An instance of IMetadataStore</returns>
@@ -2824,17 +3237,43 @@
         <member name="M:Microsoft.PackageGraph.Storage.Local.PackageStore.OpenOrCreate(System.String)">
             <summary>
             Opens an existing IMetadataStore from the specified directory. If a store does not exist,
-            or the directory does not exist, a new store is created.
+            or the directory does not exist, a new SQLite store is created.
             </summary>
             <param name="path">Path to the directory to open or create</param>
             <returns>An instance of IMetadataStore</returns>
         </member>
         <member name="M:Microsoft.PackageGraph.Storage.Local.PackageStore.Exists(System.String)">
             <summary>
-            Checks if a IMetadataStore exists in the specified directory
+            Checks if a IMetadataStore exists in the specified directory.
             </summary>
             <param name="path">Path to the directory to check.</param>
             <returns>True if a store exists under the directory, false otherwise</returns>
+        </member>
+        <member name="M:Microsoft.PackageGraph.Storage.Local.PackageStore.OptimizeSQLiteStore(System.String,System.Boolean,System.Boolean,System.Action{System.String})">
+            <summary>
+            Optimizes a local SQLite package store by compressing old uncompressed rows,
+            rebuilding compact lookup tables and optionally replacing metadata.sqlite with
+            a VACUUM INTO compact copy.
+            </summary>
+            <param name="path">Path to the local package store directory.</param>
+            <param name="replaceDatabaseFile">When true, replaces metadata.sqlite with a compact copy and keeps the previous file as a backup.</param>
+            <param name="rebuildIndexes">When true, rebuilds indexes. This also drops the old full file-location index payload.</param>
+            <param name="log">Optional progress callback.</param>
+        </member>
+        <member name="T:Microsoft.PackageGraph.Storage.Local.SQLitePackageStore">
+             <summary>
+             SQLite-backed local metadata store.
+            
+             This replaces the historical local store layout that created append-only
+             delta archives named 0.zip, 1.zip, ... . Metadata, file metadata and the
+             serialized index container now live in store/metadata.sqlite.
+             </summary>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.Local.SQLitePackageStore.IsReindexingRequired">
+            <inheritdoc cref="P:Microsoft.PackageGraph.Storage.IMetadataStore.IsReindexingRequired"/>
+        </member>
+        <member name="P:Microsoft.PackageGraph.Storage.Local.SQLitePackageStore.IsMetadataIndexingSupported">
+            <inheritdoc cref="P:Microsoft.PackageGraph.Storage.IMetadataStore.IsMetadataIndexingSupported"/>
         </member>
     </members>
 </doc>

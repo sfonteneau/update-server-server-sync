@@ -264,6 +264,188 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         }
 
         /// <summary>
+        /// Retrieves driver revision identities matching the supplied computer and
+        /// PnP hardware identifiers. All identifiers in the filter share one
+        /// previous anchor and therefore one Delta value.
+        /// </summary>
+        internal IEnumerable<MicrosoftUpdatePackageIdentity> GetDriverUpdateIds(
+            DriverUpdateFilter driverFilter,
+            out string newAnchor,
+            out int driverSetCount,
+            string oldAnchor = null)
+        {
+            if (driverFilter == null)
+            {
+                throw new ArgumentNullException(nameof(driverFilter));
+            }
+
+            if (!driverFilter.HasIdentifiers)
+            {
+                throw new ArgumentException(
+                    "At least one PnP hardware ID or computer hardware ID is required.",
+                    nameof(driverFilter));
+            }
+
+            if (AccessToken == null || AccessToken.ExpiresIn(TimeSpan.FromMinutes(2)))
+            {
+                RefreshAccessToken(null, null).GetAwaiter().GetResult();
+            }
+
+            if (ConfigData == null)
+            {
+                RefreshServerConfigData().GetAwaiter().GetResult();
+            }
+
+            var progress = new MetadataQueryProgress
+            {
+                CurrentTask = MetadataQueryStage.GetRevisionIdsStart
+            };
+            MetadataQueryProgress?.Invoke(this, progress);
+
+            var requestDelta = !string.IsNullOrEmpty(oldAnchor);
+            var requests = CreateDriverFilterRequestBatches(
+                driverFilter.ComputerIds.ToList(),
+                driverFilter.PnpHardwareIds.ToList());
+            var revisions = new HashSet<MicrosoftUpdatePackageIdentity>();
+            var driverSets = new HashSet<Guid>();
+            string synchronizationAnchor = null;
+            var requestAnchor = oldAnchor;
+
+            // GetDriverIdList can require several SOAP calls because Microsoft
+            // limits the number of computer and PnP IDs per request. The first
+            // successful response fixes the synchronization anchor for the whole
+            // cohort; all remaining calls must reuse that returned anchor. Only
+            // that first anchor is persisted for the next scheduled fetch.
+            foreach (var requestBatch in requests)
+            {
+                var request = new GetDriverIdListRequest
+                {
+                    GetDriverIdList = new GetDriverIdListRequestBody
+                    {
+                        cookie = AccessToken.AccessCookie,
+                        filter = new ServerSyncDriverFilter
+                        {
+                            DssProtocolVersion = new Microsoft.UpdateServices.WebServices.ServerSync.Version(),
+                            Anchor = requestAnchor,
+                            Categories = driverFilter.Categories
+                                .Select(category => new IdAndDelta
+                                {
+                                    Id = category,
+                                    Delta = requestDelta
+                                })
+                                .ToArray(),
+                            ComputerIds = requestBatch.ComputerIds
+                                .Select(computerId => new IdAndDelta
+                                {
+                                    Id = computerId,
+                                    Delta = requestDelta
+                                })
+                                .ToArray(),
+                            PnpHardwareIds = requestBatch.PnpHardwareIds
+                                .Select(hardwareId => new HardwareIdAndDelta
+                                {
+                                    Id = hardwareId,
+                                    Delta = requestDelta
+                                })
+                                .ToArray()
+                        }
+                    }
+                };
+
+                var response = ServerSyncClient
+                    .GetDriverIdListAsync(request)
+                    .GetAwaiter()
+                    .GetResult();
+                var result = response?
+                    .GetDriverIdListResponse1?
+                    .GetDriverIdListResult;
+                if (result == null)
+                {
+                    throw new Exception("Failed to get driver revision ID list");
+                }
+
+                if (string.IsNullOrWhiteSpace(result.Anchor))
+                {
+                    throw new Exception("The upstream server returned a driver list without an anchor");
+                }
+
+                if (synchronizationAnchor == null)
+                {
+                    synchronizationAnchor = result.Anchor;
+                    requestAnchor = synchronizationAnchor;
+                }
+
+                foreach (var rawId in result.NewRevisions ?? Array.Empty<UpdateIdentity>())
+                {
+                    revisions.Add(new MicrosoftUpdatePackageIdentity(
+                        rawId.UpdateID,
+                        rawId.RevisionNumber));
+                }
+
+                foreach (var driverSet in result.NewDriverSets ?? new ArrayOfGuid())
+                {
+                    driverSets.Add(driverSet);
+                }
+            }
+
+            newAnchor = synchronizationAnchor;
+            driverSetCount = driverSets.Count;
+            progress.CurrentTask = MetadataQueryStage.GetRevisionIdsEnd;
+            MetadataQueryProgress?.Invoke(this, progress);
+            return revisions;
+        }
+
+        private List<DriverFilterRequestBatch> CreateDriverFilterRequestBatches(
+            List<Guid> computerIds,
+            List<string> pnpHardwareIds)
+        {
+            var computerBatchSize = NormalizeServiceLimit(
+                ConfigData.MaxNumberOfComputerIdsInRequest,
+                computerIds.Count);
+            var pnpBatchSize = NormalizeServiceLimit(
+                ConfigData.MaxNumberOfPnpHardwareIdsInRequest,
+                pnpHardwareIds.Count);
+
+            var computerBatches = computerIds.Count == 0
+                ? new List<Guid[]>()
+                : CreateBatchedListFromFlatList(computerIds, computerBatchSize);
+            var pnpBatches = pnpHardwareIds.Count == 0
+                ? new List<string[]>()
+                : CreateBatchedListFromFlatList(pnpHardwareIds, pnpBatchSize);
+            var requestCount = Math.Max(computerBatches.Count, pnpBatches.Count);
+            var result = new List<DriverFilterRequestBatch>(requestCount);
+
+            for (var requestIndex = 0; requestIndex < requestCount; requestIndex++)
+            {
+                result.Add(new DriverFilterRequestBatch
+                {
+                    ComputerIds = requestIndex < computerBatches.Count
+                        ? computerBatches[requestIndex]
+                        : Array.Empty<Guid>(),
+                    PnpHardwareIds = requestIndex < pnpBatches.Count
+                        ? pnpBatches[requestIndex]
+                        : Array.Empty<string>()
+                });
+            }
+
+            return result;
+        }
+
+        private sealed class DriverFilterRequestBatch
+        {
+            public Guid[] ComputerIds { get; init; } = Array.Empty<Guid>();
+
+            public string[] PnpHardwareIds { get; init; } = Array.Empty<string>();
+        }
+
+        private static int NormalizeServiceLimit(int configuredLimit, int itemCount)
+        {
+            return configuredLimit > 0
+                ? configuredLimit
+                : Math.Max(1, itemCount);
+        }
+
+        /// <summary>
         /// Retrieves update data for the list of update ids
         /// </summary>
         /// <param name="updateIds">The ids to retrieve data for</param>

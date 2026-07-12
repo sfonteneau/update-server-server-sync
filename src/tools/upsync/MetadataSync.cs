@@ -18,7 +18,7 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
     /// <summary>
     /// Implements operations to fetch update metadata from an upstream update server
     /// </summary>
-    class MetadataSync
+    partial class MetadataSync
     {
         public static void FetchConfiguration(FetchConfigurationOptions options)
         {
@@ -94,18 +94,60 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
                 return;
             }
 
-            Console.WriteLine();
-            Console.WriteLine($"Getting list of categories. This might take up to 1 minute ...");
             using (destinationStore)
             {
-                var microsoftUpdateCategoriesSource = new UpstreamCategoriesSource(upstreamEndpoint);
-                microsoftUpdateCategoriesSource.MetadataCopyProgress += Program.OnPackageCopyProgress;
                 var cancellationToken = new CancellationTokenSource();
-                microsoftUpdateCategoriesSource.CopyTo(destinationStore, cancellationToken.Token);
+                RefreshCategoriesAndObservedProductMap(
+                    destinationStore,
+                    upstreamEndpoint,
+                    cancellationToken.Token);
             }
 
             Console.WriteLine();
             ConsoleOutput.WriteGreen("Done!");
+        }
+
+        private static void RefreshCategoriesAndObservedProductMap(
+            IMetadataStore store,
+            MicrosoftUpdate.Source.Endpoint upstreamEndpoint,
+            CancellationToken cancellationToken)
+        {
+            Console.WriteLine();
+            Console.WriteLine("Getting list of categories and detectoids. This might take up to 1 minute ...");
+
+            var microsoftUpdateCategoriesSource = new UpstreamCategoriesSource(upstreamEndpoint);
+            microsoftUpdateCategoriesSource.MetadataCopyProgress += Program.OnPackageCopyProgress;
+            microsoftUpdateCategoriesSource.CopyTo(store, cancellationToken);
+
+            RebuildObservedProductMap(store);
+        }
+
+        private static ObservedProductMapBuildResult RebuildObservedProductMap(IMetadataStore store)
+        {
+            if (!ObservedProductMapBuilder.IsSupported(store))
+            {
+                Console.WriteLine(
+                    "The selected store does not support observed inventory; " +
+                    "the detectoid-to-product map was not persisted.");
+                return null;
+            }
+
+            Console.WriteLine();
+            Console.WriteLine("Building the detectoid-to-product map from cached category metadata ...");
+            var result = ObservedProductMapBuilder.Rebuild(store);
+            Console.WriteLine(
+                $"Mapped {result.MappingCount} detectoid/product pair(s) from " +
+                $"{result.DetectoidCount} detectoid(s) and {result.ConcreteProductCount} concrete product(s). " +
+                $"Sources: detectoid categories={result.DetectoidCategoryMappingCount}, " +
+                $"product prerequisites={result.ProductPrerequisiteMappingCount}.");
+
+            if (result.SkippedPackageCount > 0)
+            {
+                ConsoleOutput.WriteRed(
+                    $"Warning: {result.SkippedPackageCount} category package(s) could not be inspected while rebuilding the map.");
+            }
+
+            return result;
         }
 
         public static void FetchPackagesUpdates(FetchPackagesOptions options)
@@ -127,6 +169,274 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
             }
         }
 
+        private static void FetchObservedProducts(
+            FetchObservedOptions options,
+            IMetadataStore store)
+        {
+            if (options == null)
+            {
+                throw new ArgumentNullException(nameof(options));
+            }
+
+            if (!string.Equals(
+                options.EndpointType,
+                FetchPackagesOptions.MicrosoftUpdateEndpoint,
+                StringComparison.OrdinalIgnoreCase))
+            {
+                throw new NotSupportedException(
+                    "fetch-observed currently supports only --endpoint-type microsoft-update.");
+            }
+
+            if (options.SeenWithinDays < 0)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(options.SeenWithinDays),
+                    "--seen-within-days must be zero or greater.");
+            }
+
+                if (store is not IObservedInventoryStore observedInventoryStore)
+                {
+                    throw new InvalidOperationException(
+                        "fetch-observed requires a local SQLite store with observed inventory support.");
+                }
+
+                if (store is not ISyncAnchorStore || store is not ISyncCheckpointStore)
+                {
+                    throw new InvalidOperationException(
+                        "fetch-observed requires a store that supports persistent WSUS anchors and resumable checkpoints.");
+                }
+
+                var upstreamEndpoint = string.IsNullOrEmpty(options.UpstreamEndpoint)
+                    ? MicrosoftUpdate.Source.Endpoint.Default
+                    : new MicrosoftUpdate.Source.Endpoint(options.UpstreamEndpoint);
+                var cancellationToken = new CancellationTokenSource();
+                var mapWasRebuilt = false;
+                var hasCachedObservedProductCatalog = HasCachedObservedProductCatalog(store);
+
+                if (options.DryRun && options.RefreshCategories)
+                {
+                    throw new InvalidOperationException(
+                        "--dry-run cannot be combined with --refresh-categories because a dry run never contacts Microsoft Update.");
+                }
+
+                if (options.RefreshCategories || !hasCachedObservedProductCatalog)
+                {
+                    if (options.DryRun)
+                    {
+                        throw new InvalidOperationException(
+                            "The local store does not contain the product, classification and detectoid catalog required by fetch-observed. " +
+                            "Run pre-fetch first, then retry --dry-run.");
+                    }
+
+                    RefreshCategoriesAndObservedProductMap(
+                        store,
+                        upstreamEndpoint,
+                        cancellationToken.Token);
+                    mapWasRebuilt = true;
+                }
+
+                var initialMapStatus = observedInventoryStore.GetDetectoidProductMapStatus();
+                if (!mapWasRebuilt
+                    && (options.RebuildProductMap || initialMapStatus.RebuiltAt == null))
+                {
+                    RebuildObservedProductMap(store);
+                }
+
+                var seenSince = options.SeenWithinDays > 0
+                    ? DateTimeOffset.UtcNow.AddDays(-options.SeenWithinDays)
+                    : (DateTimeOffset?)null;
+                var mapStatus = observedInventoryStore.GetDetectoidProductMapStatus(seenSince);
+                var observedProducts = observedInventoryStore
+                    .GetObservedProductCategories(seenSince)
+                    .ToList();
+
+                Console.WriteLine();
+                Console.WriteLine("Observed product fetch");
+                Console.WriteLine("======================");
+                Console.WriteLine(seenSince.HasValue
+                    ? $"Observation window : last {options.SeenWithinDays} day(s)"
+                    : "Observation window : all observations");
+                Console.WriteLine(
+                    $"Product map       : {mapStatus.MappingCount} pair(s), " +
+                    $"{mapStatus.MappedDetectoidCount} detectoid(s), " +
+                    $"{mapStatus.ProductCount} product(s)");
+                Console.WriteLine(
+                    $"Active detectoids : {mapStatus.ActiveMappedDetectoidCount} mapped, " +
+                    $"{mapStatus.ActiveUnmappedDetectoidCount} unmapped");
+
+                if (mapStatus.ActiveUnmappedDetectoidCount > 0)
+                {
+                    ConsoleOutput.WriteRed(
+                        "Warning: some observed detectoids do not resolve to a concrete product. " +
+                        "They are ignored to avoid broad, unsafe product inference.");
+                }
+
+                if (observedProducts.Count == 0)
+                {
+                    Console.WriteLine("No concrete product was resolved from recent client scans. Nothing to fetch.");
+                    return;
+                }
+
+                var concreteProducts = GetLatestConcreteProducts(store);
+                var unknownProductIds = observedProducts
+                    .Where(observed => !concreteProducts.ContainsKey(observed.ProductCategoryId))
+                    .Select(observed => observed.ProductCategoryId)
+                    .ToList();
+                if (unknownProductIds.Count > 0)
+                {
+                    ConsoleOutput.WriteRed(
+                        $"Warning: {unknownProductIds.Count} mapped product(s) are not present as concrete " +
+                        "product categories in the current store and will be skipped. Run pre-fetch again.");
+                }
+
+                var selectedProducts = observedProducts
+                    .Where(observed => concreteProducts.ContainsKey(observed.ProductCategoryId))
+                    .OrderBy(observed => concreteProducts[observed.ProductCategoryId].Title ?? string.Empty)
+                    .ThenBy(observed => observed.ProductCategoryId)
+                    .ToList();
+                if (selectedProducts.Count == 0)
+                {
+                    Console.WriteLine("No locally known concrete observed product remains to fetch.");
+                    return;
+                }
+
+                var classificationFilter = CreateFilterListForCategory<ClassificationCategory>(
+                    options.ClassificationsFilter,
+                    store,
+                    includeAllWhenEmpty: false);
+                if (classificationFilter.Count == 0)
+                {
+                    throw new InvalidOperationException(
+                        "At least one --classification-filter GUID is required for fetch-observed.");
+                }
+
+                var knownClassificationIds = store
+                    .OfType<ClassificationCategory>()
+                    .Select(classification => classification.Id.ID)
+                    .ToHashSet();
+                var unknownClassificationIds = classificationFilter
+                    .Where(classificationId => !knownClassificationIds.Contains(classificationId))
+                    .ToList();
+                if (unknownClassificationIds.Count > 0)
+                {
+                    throw new InvalidOperationException(
+                        "The following classification GUID(s) are not present in the local pre-fetch catalog: " +
+                        string.Join(", ", unknownClassificationIds.Select(value => value.ToString("D"))) +
+                        ". Run pre-fetch or use --refresh-categories.");
+                }
+
+                var languageFilter = CreateLanguageFilter(options.LanguageFilter);
+                var stripUnrequestedLocalizedProperties =
+                    languageFilter.Count > 0 && !options.KeepAllLocalizedProperties;
+
+                Console.WriteLine(
+                    $"Products selected  : {selectedProducts.Count}; " +
+                    $"classifications={classificationFilter.Count}; " +
+                    $"languages={(languageFilter.Count == 0 ? "all" : string.Join(",", languageFilter))}");
+
+                if (options.DryRun)
+                {
+                    Console.WriteLine();
+                    Console.WriteLine("Dry run: no upstream request will be sent.");
+                    foreach (var observedProduct in selectedProducts)
+                    {
+                        var product = concreteProducts[observedProduct.ProductCategoryId];
+                        var title = string.IsNullOrWhiteSpace(product.Title)
+                            ? "(untitled product)"
+                            : product.Title;
+                        Console.WriteLine(
+                            $"{observedProduct.ProductCategoryId:D}  {title}  " +
+                            $"detectoids={observedProduct.DetectoidCount}  " +
+                            $"last={observedProduct.LastSeen.ToUniversalTime():yyyy-MM-dd HH:mm:ss} UTC");
+                    }
+
+                    return;
+                }
+
+                var failures = new List<Exception>();
+                var productNumber = 0;
+                foreach (var observedProduct in selectedProducts)
+                {
+                    cancellationToken.Token.ThrowIfCancellationRequested();
+                    productNumber++;
+                    var product = concreteProducts[observedProduct.ProductCategoryId];
+                    var title = string.IsNullOrWhiteSpace(product.Title)
+                        ? observedProduct.ProductCategoryId.ToString("D")
+                        : product.Title;
+
+                    Console.WriteLine();
+                    Console.WriteLine(
+                        $"[{productNumber}/{selectedProducts.Count}] {title} " +
+                        $"({observedProduct.ProductCategoryId:D})");
+                    Console.WriteLine(
+                        $"Observed from {observedProduct.DetectoidCount} detectoid(s); " +
+                        $"last seen {observedProduct.LastSeen.ToUniversalTime():yyyy-MM-dd HH:mm:ss} UTC.");
+
+                    var sourceFilter = new UpstreamSourceFilter(
+                        new List<Guid> { observedProduct.ProductCategoryId },
+                        classificationFilter,
+                        languageFilter,
+                        stripUnrequestedLocalizedProperties);
+                    var anchorKey = BuildSyncAnchorKey(upstreamEndpoint, sourceFilter);
+
+                    try
+                    {
+                        FetchMicrosoftUpdateRevisions(
+                            options,
+                            store,
+                            upstreamEndpoint,
+                            sourceFilter,
+                            anchorKey,
+                            cancellationToken.Token);
+                    }
+                    catch (Exception ex)
+                    {
+                        failures.Add(new InvalidOperationException(
+                            $"Observed product fetch failed for {title} " +
+                            $"({observedProduct.ProductCategoryId:D}).",
+                            ex));
+                        ConsoleOutput.WriteRed(
+                            $"Product fetch failed; its stable anchor/checkpoint state was preserved: {ex.Message}");
+                    }
+                }
+
+                Console.WriteLine();
+                if (failures.Count > 0)
+                {
+                    throw new AggregateException(
+                        $"fetch-observed completed with {failures.Count} failed product scope(s).",
+                        failures);
+                }
+
+                ConsoleOutput.WriteGreen(
+                    $"Done. {selectedProducts.Count} observed product scope(s) synchronized.");
+        }
+
+        private static Dictionary<Guid, ProductCategory> GetLatestConcreteProducts(IMetadataStore store)
+        {
+            var result = new Dictionary<Guid, ProductCategory>();
+            foreach (var group in store.OfType<ProductCategory>().GroupBy(product => product.Id.ID))
+            {
+                var latest = group
+                    .OrderByDescending(product => product.Id.Revision)
+                    .First();
+                try
+                {
+                    if (ObservedProductMapBuilder.IsConcreteProduct(latest))
+                    {
+                        result[latest.Id.ID] = latest;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ConsoleOutput.WriteRed(
+                        $"Warning: cannot inspect product category {latest.Id}: {ex.Message}");
+                }
+            }
+
+            return result;
+        }
+
         private static void FetchMicrosoftUpdatePackages(FetchPackagesOptions options, IMetadataStore store)
         {
             var upstreamEndpoint = string.IsNullOrEmpty(options.UpstreamEndpoint) ? MicrosoftUpdate.Source.Endpoint.Default : new MicrosoftUpdate.Source.Endpoint(options.UpstreamEndpoint);
@@ -142,16 +452,20 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
                 var cancellationToken = new CancellationTokenSource();
                 if (options.RefreshCategories || StoreIsEmpty(store))
                 {
-                    var microsoftUpdateCategoriesSource = new UpstreamCategoriesSource(upstreamEndpoint);
-
-                    Console.WriteLine($"Getting list of categories. This might take up to 1 minute ...");
-
-                    microsoftUpdateCategoriesSource.MetadataCopyProgress += Program.OnPackageCopyProgress;
-                    microsoftUpdateCategoriesSource.CopyTo(store, cancellationToken.Token);
+                    RefreshCategoriesAndObservedProductMap(
+                        store,
+                        upstreamEndpoint,
+                        cancellationToken.Token);
                 }
                 else
                 {
                     Console.WriteLine("Using cached categories. Pass --refresh-categories to update them.");
+
+                    if (store is IObservedInventoryStore observedInventoryStore
+                        && observedInventoryStore.GetDetectoidProductMapStatus().RebuiltAt == null)
+                    {
+                        RebuildObservedProductMap(store);
+                    }
                 }
 
                 if (HasValues(options.Ids))
@@ -215,7 +529,7 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
         }
 
         private static void FetchMicrosoftUpdateRevisions(
-            FetchPackagesOptions options,
+            IIncrementalSyncOptions options,
             IMetadataStore store,
             MicrosoftUpdate.Source.Endpoint upstreamEndpoint,
             UpstreamSourceFilter sourceFilter,
@@ -519,6 +833,13 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
             return metadataSource.GetPackageIdentities().Count == 0;
         }
 
+        private static bool HasCachedObservedProductCatalog(IMetadataStore metadataSource)
+        {
+            return metadataSource.OfType<ProductCategory>().Any()
+                && metadataSource.OfType<ClassificationCategory>().Any()
+                && metadataSource.OfType<DetectoidCategory>().Any();
+        }
+
         private static List<Guid> CreateFilterListForCategory<T>(IEnumerable<string> userFilterList, IMetadataStore metadataSource, bool includeAllWhenEmpty)
         {
             var userFilters = userFilterList?
@@ -559,9 +880,9 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
             return filterList.Distinct().ToList();
         }
 
-        private static List<int> CreateLanguageFilterFromOptions(FetchPackagesOptions options)
+        private static List<int> CreateLanguageFilter(IEnumerable<string> requestedLanguages)
         {
-            var languageOptions = options.LanguageFilter?.ToList() ?? new List<string>();
+            var languageOptions = requestedLanguages?.ToList() ?? new List<string>();
             if (languageOptions.Count == 0)
             {
                 // Default to English only. This avoids syncing every localized metadata branch.
@@ -662,7 +983,7 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
                 metadataSource,
                 includeAllWhenEmpty: true);
 
-            List<int> languageFilter = CreateLanguageFilterFromOptions(options);
+            List<int> languageFilter = CreateLanguageFilter(options.LanguageFilter);
             bool stripUnrequestedLocalizedProperties = languageFilter.Count > 0 && !options.KeepAllLocalizedProperties;
 
             return new UpstreamSourceFilter(productFilter, classificationFilter, languageFilter, stripUnrequestedLocalizedProperties);

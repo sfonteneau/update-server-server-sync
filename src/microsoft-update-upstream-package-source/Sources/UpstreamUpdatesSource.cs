@@ -19,6 +19,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
     {
         private readonly UpstreamServerClient _Client;
         private readonly string _OldAnchor;
+        private readonly DriverUpdateFilter _DriverFilter;
         private UpstreamSourceFilter _Filter;
 
         private List<MicrosoftUpdatePackageIdentity> _Identities;
@@ -28,6 +29,12 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// Persist it only after the retrieved metadata has been written successfully.
         /// </summary>
         public string NewAnchor { get; private set; }
+
+        /// <summary>
+        /// Gets the number of driver-set identities reported by GetDriverIdList.
+        /// It is zero for regular GetRevisionIdList sources.
+        /// </summary>
+        public int DriverSetCount { get; private set; }
 
         /// <summary>
         /// Client-side metadata retrieval batch size. This is independent from the
@@ -54,7 +61,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// <param name="upstreamEndpoint">Endpoint to get updates from</param>
         /// <param name="filter">Filter to apply when retrieving updates from this source.</param>
         public UpstreamUpdatesSource(Endpoint upstreamEndpoint, UpstreamSourceFilter filter)
-            : this(upstreamEndpoint, filter, null)
+            : this(upstreamEndpoint, filter, null, null)
         {
         }
 
@@ -65,10 +72,28 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// <param name="filter">Filter to apply when retrieving updates from this source.</param>
         /// <param name="oldAnchor">Previously saved WSUS anchor for this exact endpoint/filter.</param>
         public UpstreamUpdatesSource(Endpoint upstreamEndpoint, UpstreamSourceFilter filter, string oldAnchor)
+            : this(upstreamEndpoint, filter, oldAnchor, null)
+        {
+        }
+
+        /// <summary>
+        /// Creates a package source using the driver-inventory GetDriverIdList path.
+        /// GetUpdateData is still used to materialize each returned driver revision.
+        /// </summary>
+        /// <param name="upstreamEndpoint">Endpoint to get updates from.</param>
+        /// <param name="filter">Filter used while materializing update metadata.</param>
+        /// <param name="oldAnchor">Previous anchor shared by every identifier in the driver filter.</param>
+        /// <param name="driverFilter">Hardware identifiers sent to GetDriverIdList.</param>
+        public UpstreamUpdatesSource(
+            Endpoint upstreamEndpoint,
+            UpstreamSourceFilter filter,
+            string oldAnchor,
+            DriverUpdateFilter driverFilter)
         {
             _Client = new UpstreamServerClient(upstreamEndpoint);
             _Filter = filter;
             _OldAnchor = oldAnchor;
+            _DriverFilter = driverFilter;
         }
 
         private void RetrievePackageIdentities()
@@ -77,8 +102,23 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
             {
                 if (_Identities == null)
                 {
-                    _Identities = _Client
-                        .GetUpdateIds(_Filter, out var newAnchor, _OldAnchor)
+                    IEnumerable<MicrosoftUpdatePackageIdentity> identities;
+                    string newAnchor;
+                    if (_DriverFilter == null)
+                    {
+                        identities = _Client.GetUpdateIds(_Filter, out newAnchor, _OldAnchor);
+                    }
+                    else
+                    {
+                        identities = _Client.GetDriverUpdateIds(
+                            _DriverFilter,
+                            out newAnchor,
+                            out var driverSetCount,
+                            _OldAnchor);
+                        DriverSetCount = driverSetCount;
+                    }
+
+                    _Identities = identities
                         .Distinct()
                         .ToList();
                     _Identities.Sort();
@@ -89,7 +129,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
 
         /// <summary>
         /// Retrieves and caches the complete revision identity list returned by
-        /// GetRevisionIdList for this source and anchor.
+        /// GetRevisionIdList or GetDriverIdList for this source and anchor.
         /// </summary>
         public IReadOnlyList<MicrosoftUpdatePackageIdentity> GetPackageIdentities()
         {

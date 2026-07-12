@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
 using CommandLine;
@@ -19,6 +19,15 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
     {
         string UpstreamEndpoint { get; }
         string EndpointType { get; }
+    }
+
+    public interface IIncrementalSyncOptions
+    {
+        bool IgnoreSyncAnchor { get; }
+
+        bool ResetSyncCheckpoint { get; }
+
+        int MetadataBatchSize { get; }
     }
 
     public interface IMetadataStoreOptions
@@ -143,7 +152,7 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
     }
 
     [Verb("fetch", HelpText = "Retrieves metadata from an upstream server")]
-    public class FetchPackagesOptions : IMetadataStoreOptions, IMetadataSourceOptions
+    public class FetchPackagesOptions : IMetadataStoreOptions, IMetadataSourceOptions, IIncrementalSyncOptions
     {
         public const string MicrosoftUpdateEndpoint = "microsoft-update";
         public const string NuGetV3Endpoint = "nuget";
@@ -203,6 +212,67 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
 
         [Option("ids", Required = false, Separator = '+', HelpText = "Try fetch metadata for this list of ids (GUIDs)")]
         public IEnumerable<string> Ids { get; set; }
+    }
+
+    [Verb("fetch-observed", HelpText = "Fetches product updates and drivers observed during Windows Update client scans")]
+    public class FetchObservedOptions : IMetadataStoreOptions, IMetadataSourceOptions, IIncrementalSyncOptions
+    {
+        [Option("store-alias", Required = false, HelpText = "Destination store alias")]
+        public string Alias { get; set; }
+
+        [Option("store-path", Required = false, HelpText = "Destination store containing observed inventory")]
+        public string Path { get; set; }
+
+        [Option("store-type", Required = false, Default = "local", HelpText = "Store type; observed fetch currently requires a local SQLite store")]
+        public string Type { get; set; }
+
+        [Option("connection-string", Required = false, HelpText = "Unused for local observed product fetch")]
+        public string StoreConnectionString { get; set; }
+
+        [Option("endpoint", Required = false, HelpText = "The Microsoft Update endpoint from which to fetch updates")]
+        public string UpstreamEndpoint { get; set; }
+
+        [Option("endpoint-type", Required = false, Default = FetchPackagesOptions.MicrosoftUpdateEndpoint, HelpText = "Upstream endpoint type; only microsoft-update is supported")]
+        public string EndpointType { get; set; }
+
+        [Option("classification-filter", Required = false, Separator = '+', HelpText = "Classification GUIDs to fetch for each observed product; required unless --skip-products is used")]
+        public IEnumerable<string> ClassificationsFilter { get; set; }
+
+        [Option("language-filter", Required = false, Separator = '+', HelpText = "Language LCIDs or short names to sync. Default: 1033/en. Use all to disable the language filter")]
+        public IEnumerable<string> LanguageFilter { get; set; }
+
+        [Option("seen-within-days", Required = false, Default = 30, HelpText = "Use product and hardware observations seen within this many days; use 0 for all observations")]
+        public int SeenWithinDays { get; set; }
+
+        [Option("skip-products", Required = false, Default = false, HelpText = "Do not fetch software updates for observed products")]
+        public bool SkipProducts { get; set; }
+
+        [Option("skip-drivers", Required = false, Default = false, HelpText = "Do not fetch drivers for observed hardware identifiers")]
+        public bool SkipDrivers { get; set; }
+
+        [Option("include-compatible-ids", Required = false, Default = false, HelpText = "Include generic Compatible IDs in driver queries. Disabled by default because it can greatly broaden matches")]
+        public bool IncludeCompatibleIds { get; set; }
+
+        [Option("refresh-categories", Required = false, Default = false, HelpText = "Refresh categories/detectoids before resolving observed products")]
+        public bool RefreshCategories { get; set; }
+
+        [Option("rebuild-product-map", Required = false, Default = false, HelpText = "Rebuild the cached detectoid-to-product map before fetching")]
+        public bool RebuildProductMap { get; set; }
+
+        [Option("ignore-sync-anchor", Required = false, Default = false, HelpText = "Ignore saved product and per-identifier driver anchors and request full revision lists")]
+        public bool IgnoreSyncAnchor { get; set; }
+
+        [Option("reset-sync-checkpoint", Required = false, Default = false, HelpText = "Discard unfinished product and driver checkpoints for the selected scopes before starting")]
+        public bool ResetSyncCheckpoint { get; set; }
+
+        [Option("metadata-batch-size", Required = false, Default = 100, HelpText = "Number of update identities retrieved and stored per local checkpoint batch")]
+        public int MetadataBatchSize { get; set; }
+
+        [Option("keep-all-localized-properties", Required = false, Default = false, HelpText = "Do not strip non-requested LocalizedProperties from stored metadata")]
+        public bool KeepAllLocalizedProperties { get; set; }
+
+        [Option("dry-run", Required = false, Default = false, HelpText = "Display observed product and driver scopes without contacting Microsoft Update")]
+        public bool DryRun { get; set; }
     }
 
     [Verb("fetch-content", HelpText = "Downloads update content from an upstream server")]
@@ -271,6 +341,57 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
 
         [Option("connection-string", Required = false, HelpText = "Azure connection string; required when the store type is azure")]
         public string StoreConnectionString { get; set; }
+    }
+
+
+    [Verb("observed-status", HelpText = "Displays product detectoids and hardware identifiers observed during Windows Update client scans")]
+    public class ObservedInventoryStatusOptions : IMetadataStoreOptions
+    {
+        [Option("store-alias", Required = false, HelpText = "Store alias")]
+        public string Alias { get; set; }
+
+        [Option("store-path", Required = false, HelpText = "Store containing observed inventory")]
+        public string Path { get; set; }
+
+        [Option("store-type", Required = false, Default = "local", HelpText = "Store type; observed inventory currently requires a local SQLite store")]
+        public string Type { get; set; }
+
+        [Option("connection-string", Required = false, HelpText = "Unused for local observed inventory")]
+        public string StoreConnectionString { get; set; }
+
+        [Option("seen-within-days", Required = false, Default = 30, HelpText = "Count and display identifiers seen within this many days; use 0 for all observations")]
+        public int SeenWithinDays { get; set; }
+
+        [Option("limit", Required = false, Default = 10, HelpText = "Number of most recently observed values displayed for each kind; use 0 for counts only")]
+        public int Limit { get; set; }
+
+        [Option("history-limit", Required = false, Default = 5, HelpText = "Number of recent fetch-observed executions displayed; use 0 to hide history")]
+        public int HistoryLimit { get; set; }
+    }
+
+    [Verb("prune-observed", HelpText = "Deletes stale observed inventory and optionally stale per-identifier driver anchors")]
+    public class PruneObservedInventoryOptions : IMetadataStoreOptions
+    {
+        [Option("store-alias", Required = false, HelpText = "Store alias")]
+        public string Alias { get; set; }
+
+        [Option("store-path", Required = false, HelpText = "Store containing observed inventory")]
+        public string Path { get; set; }
+
+        [Option("store-type", Required = false, Default = "local", HelpText = "Store type; pruning currently requires a local SQLite store")]
+        public string Type { get; set; }
+
+        [Option("connection-string", Required = false, HelpText = "Unused for local observed inventory")]
+        public string StoreConnectionString { get; set; }
+
+        [Option("older-than-days", Required = false, Default = 180, HelpText = "Delete observations not seen for this many days")]
+        public int OlderThanDays { get; set; }
+
+        [Option("prune-driver-anchors", Required = false, Default = false, HelpText = "Also delete stale per-identifier driver anchors that have no active observation and are not part of a checkpoint")]
+        public bool PruneDriverAnchors { get; set; }
+
+        [Option("dry-run", Required = false, Default = false, HelpText = "Show how many observations would be deleted without modifying SQLite")]
+        public bool DryRun { get; set; }
     }
 
     [Verb("query", HelpText = "Query package metadata from a package store")]
@@ -459,6 +580,7 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
 
         [Option("endpoint", Required = false, Default = "*", HelpText = "The port to bind the server to.")]
         public string Endpoint { get; set; }
+
     }
 
     [Verb("copy-metadata", HelpText = "Copy packages from one repository to another")]

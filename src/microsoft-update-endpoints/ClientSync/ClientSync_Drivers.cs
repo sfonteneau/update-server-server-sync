@@ -1,110 +1,124 @@
-﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
+using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Drivers;
+using Microsoft.UpdateServices.WebServices.ClientSync;
 using System;
 using System.Collections.Generic;
-using System.Threading.Tasks;
 using System.Linq;
-using Microsoft.UpdateServices.WebServices.ClientSync;
-using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Drivers;
-using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
+using System.ServiceModel;
+using System.Threading.Tasks;
 
 namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
 {
-
     public partial class ClientSyncWebService
     {
         /// <summary>
-        /// Handle driver sync requests
+        /// Handles driver discovery directly from SQLite. The direct store queries
+        /// only metadata rows matching the device hardware IDs.
         /// </summary>
-        /// <param name="parameters"></param>
-        /// <returns></returns>
         private Task<SyncInfo> DoDriversSync(SyncUpdateParameters parameters)
         {
-            // Get list of driver updates known to the client
-            var cachedDrivers = GetUpdateIdentitiesFromClientIndexes(parameters.CachedDriverIDs);
-
-            // Get list of installed non-leaf updates. Used to match pre-requisites for driver updates
-            var installedNonLeafUpdatesGuids = GetInstalledNotLeafGuidsFromSyncParameters(parameters);
-
-            // Initialize the response
-            var syncResult = new SyncInfo()
+            if (MetadataSource == null)
             {
-                NewCookie = new Cookie() { Expiration = DateTime.Now.AddDays(5), EncryptedData = new byte[12] },
+                throw new FaultException("Metadata source is not configured.");
+            }
+
+            var cachedDrivers = GetUpdateIdentitiesFromClientIndexes(
+                parameters.CachedDriverIDs);
+            var installedNonLeaf = GetInstalledNotLeafGuidsFromSyncParameters(parameters);
+            var computerHardwareIds = parameters.ComputerSpec?.HardwareIDs?.ToList()
+                ?? new List<Guid>();
+            var driverUpdates = new List<UpdateInfo>();
+            var unapprovedDriversMatched = new List<DriverUpdate>();
+            var addedRevisionIds = new HashSet<int>();
+
+            var syncResult = new SyncInfo
+            {
+                NewCookie = new Cookie
+                {
+                    Expiration = DateTime.Now.AddDays(5),
+                    EncryptedData = new byte[12]
+                },
                 DriverSyncNotNeeded = "false",
                 Truncated = false
             };
 
-            List<Guid> computerHardwareIds = parameters.ComputerSpec.HardwareIDs != null ? parameters.ComputerSpec.HardwareIDs.ToList() : new List<Guid>();
-
-            List<UpdateInfo> driverUpdates = new();
-
-            List<DriverUpdate> unapprovedDriversMatched = new();
-
-            // Go through all client reported devices
-            foreach (var device in parameters.SystemSpec)
+            foreach (var device in parameters.SystemSpec ?? Array.Empty<Device>())
             {
-                // Combine the list hardware ids and compatible hwids; we will
-                // match them in this order, from specific to less specific
-                var hardwareIdsToMatch = new List<string>(device.HardwareIDs);
+                if (device == null)
+                {
+                    continue;
+                }
+
+                var hardwareIdsToMatch = new List<string>(
+                    device.HardwareIDs ?? Array.Empty<string>());
                 if (device.CompatibleIDs != null)
                 {
                     hardwareIdsToMatch.AddRange(device.CompatibleIDs);
                 }
 
-                // Get best match driver
-                var driverMatchResult = DriverMatcher.MatchDriver(hardwareIdsToMatch, computerHardwareIds, installedNonLeafUpdatesGuids);
-
-                // If we have a match and the client does not have it, add it to the list
-                if (driverMatchResult != null &&
-                    !cachedDrivers.Contains(driverMatchResult.Driver.Id) &&
-                    !IsInstalledDriverBetterMatch(device.installedDriver, driverMatchResult, hardwareIdsToMatch, computerHardwareIds))
+                var driverMatchResult = MetadataSource.MatchDriver(
+                    hardwareIdsToMatch,
+                    computerHardwareIds,
+                    installedNonLeaf);
+                if (driverMatchResult == null
+                    || cachedDrivers.Contains(driverMatchResult.Driver.Id)
+                    || (device.installedDriver != null
+                        && IsInstalledDriverBetterMatch(
+                            device.installedDriver,
+                            driverMatchResult,
+                            hardwareIdsToMatch,
+                            computerHardwareIds)))
                 {
-                    if (ApprovedDriverUpdates.Contains(driverMatchResult.Driver.Id))
-                    {
-                        // Get core XML fragment for driver update
-                        var coreXml = GetCoreFragment(driverMatchResult.Driver.Id);
-
-                        driverUpdates.Add(new UpdateInfo()
-                        {
-                            Deployment = new Deployment()
-                            {
-                                Action = DeploymentAction.Install,
-                                ID = 25000,
-                                AutoDownload = "0",
-                                AutoSelect = "0",
-                                SupersedenceBehavior = "0",
-                                IsAssigned = true,
-                                LastChangeTime = "2019-08-06"
-                            },
-                            ID = IdToRevisionMap[driverMatchResult.Driver.Id.ID],
-                            IsLeaf = true,
-                            Xml = coreXml,
-                            IsShared = false,
-                            Verification = null
-                        });
-                    }
-                    else
-                    {
-                        unapprovedDriversMatched.Add(driverMatchResult.Driver);
-                    }
+                    continue;
                 }
 
-                // Stop matching if we have max updates already
-                if (driverUpdates.Count == MaxUpdatesInResponse)
+                if (!ApprovedDriverUpdates.Contains(driverMatchResult.Driver.Id))
+                {
+                    unapprovedDriversMatched.Add(driverMatchResult.Driver);
+                    continue;
+                }
+
+                var revisionId = MetadataSource.GetRevisionId(driverMatchResult.Driver.Id);
+                if (revisionId < 0 || !addedRevisionIds.Add(revisionId))
+                {
+                    continue;
+                }
+
+                driverUpdates.Add(new UpdateInfo
+                {
+                    Deployment = new Deployment
+                    {
+                        Action = DeploymentAction.Install,
+                        ID = 25000,
+                        AutoDownload = "0",
+                        AutoSelect = "0",
+                        SupersedenceBehavior = "0",
+                        IsAssigned = true,
+                        LastChangeTime = "2019-08-06"
+                    },
+                    ID = revisionId,
+                    IsLeaf = true,
+                    Xml = GetCoreFragment(driverMatchResult.Driver.Id),
+                    IsShared = false,
+                    Verification = null
+                });
+
+                if (driverUpdates.Count >= MaxUpdatesInResponse)
                 {
                     syncResult.Truncated = true;
                     break;
                 }
             }
 
-            if(unapprovedDriversMatched.Count > 0)
+            if (unapprovedDriversMatched.Count > 0)
             {
                 OnUnApprovedDriverUpdatesRequested?.Invoke(unapprovedDriversMatched);
             }
 
             syncResult.NewUpdates = driverUpdates.ToArray();
-
             return Task.FromResult(syncResult);
         }
 

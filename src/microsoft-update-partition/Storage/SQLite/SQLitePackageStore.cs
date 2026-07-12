@@ -5,6 +5,8 @@ using Microsoft.Data.Sqlite;
 using Microsoft.PackageGraph.MicrosoftUpdate.Index;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Content;
+using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Drivers;
+using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Prerequisites;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Parsers;
 using Microsoft.PackageGraph.ObjectModel;
 using Microsoft.PackageGraph.Partitions;
@@ -32,16 +34,20 @@ namespace Microsoft.PackageGraph.Storage.Local
     /// delta archives named 0.zip, 1.zip, ... . Metadata, file metadata and the
     /// serialized index container now live in store/metadata.sqlite.
     /// </summary>
-    class SQLitePackageStore : IMetadataSink, IMetadataStore, IMetadataLookup, IMicrosoftUpdateFileLocationLookup, ISyncAnchorStore, ISyncCheckpointStore
+    class SQLitePackageStore : IMetadataSink, IMetadataStore, IMetadataLookup, IMicrosoftUpdateFileLocationLookup, ISyncAnchorStore, ISyncCheckpointStore, IObservedInventoryStore, IDriverSyncStateStore, IReloadableMetadataStore, IMetadataCatalogPublicationControl, IObservedOperationsStore
     {
         public const string DatabaseFileName = "metadata.sqlite";
 
-        private const int SchemaVersion = 3;
+        private const int SchemaVersion = 8;
         private const string IndexBlobKey = "indexes.zip";
         private const string CompressionNone = "none";
         private const string CompressionBrotli = "br";
         private const string CompressionGZip = "gzip";
         private const int OptimizeBatchSize = 200;
+        private const int MaxObservedValuesPerType = 20000;
+        private const int MaxObservedIdentifierLength = 2048;
+        private const string CatalogPublicationDeferredKey = "catalog_publication_deferred";
+        private const string CatalogUnpublishedChangesKey = "catalog_unpublished_changes";
 
         private readonly string TargetPath;
         private readonly string DatabasePath;
@@ -58,6 +64,9 @@ namespace Microsoft.PackageGraph.Storage.Local
         private bool IsDisposed;
         private bool _IsReindexingRequired;
         private bool _FileLocationFileJsonIsRequired;
+        private bool CatalogGenerationDirty;
+        private bool IsCatalogGenerationPublicationDeferred;
+        private MetadataStoreGenerationInfo LoadedMetadataGeneration;
 
         private MemoryStream IndexBackingStream;
         private ZipStreamIndexContainer Indexes;
@@ -120,11 +129,27 @@ namespace Microsoft.PackageGraph.Storage.Local
             ExecuteNonQuery("PRAGMA journal_mode=WAL;");
             ExecuteNonQuery("PRAGMA synchronous=NORMAL;");
             ExecuteNonQuery("PRAGMA foreign_keys=ON;");
+            // Client scans and the scheduled fetch-observed process can write to
+            // the same WAL database. Wait for the current writer instead of
+            // failing a scan immediately with SQLITE_BUSY.
+            ExecuteNonQuery("PRAGMA busy_timeout=30000;");
 
-            InitializeSchema();
-            EnsureCompressionSchema();
+            if (isNewDatabase)
+            {
+                InitializeSchema();
+            }
+            else
+            {
+                ValidateExistingSchema();
+            }
+
+            IsCatalogGenerationPublicationDeferred =
+                string.Equals(ReadProperty(CatalogPublicationDeferredKey), "1", StringComparison.Ordinal);
+            CatalogGenerationDirty =
+                string.Equals(ReadProperty(CatalogUnpublishedChangesKey), "1", StringComparison.Ordinal);
             LoadPackageMaps();
             LoadIndexes();
+            LoadedMetadataGeneration = ReadMetadataGenerationInfo();
 
             if (autoReindex && _IsReindexingRequired)
             {
@@ -162,6 +187,7 @@ CREATE TABLE IF NOT EXISTS packages (
     open_id_hex TEXT NOT NULL,
     identity TEXT NOT NULL,
     package_type INTEGER NOT NULL,
+    published INTEGER NOT NULL DEFAULT 1 CHECK(published IN (0, 1)),
     metadata BLOB NOT NULL,
     metadata_compression TEXT NOT NULL DEFAULT 'br',
     files_json TEXT NULL,
@@ -177,6 +203,62 @@ ON packages(identity);
 
 CREATE INDEX IF NOT EXISTS idx_packages_partition_openid
 ON packages(partition, open_id_hex);
+
+CREATE INDEX IF NOT EXISTS idx_packages_published_type
+ON packages(published, package_type, package_index);
+
+CREATE TABLE IF NOT EXISTS client_sync_packages (
+    package_index INTEGER PRIMARY KEY,
+    update_id TEXT NOT NULL,
+    revision_number INTEGER NOT NULL,
+    FOREIGN KEY(package_index) REFERENCES packages(package_index) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_client_sync_packages_update
+ON client_sync_packages(update_id, revision_number, package_index);
+
+CREATE TABLE IF NOT EXISTS client_sync_prerequisites (
+    package_index INTEGER NOT NULL,
+    prerequisite_update_id TEXT NOT NULL,
+    is_category INTEGER NOT NULL DEFAULT 0 CHECK(is_category IN (0, 1)),
+    PRIMARY KEY(package_index, prerequisite_update_id, is_category),
+    FOREIGN KEY(package_index) REFERENCES packages(package_index) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_client_sync_prerequisites_target
+ON client_sync_prerequisites(prerequisite_update_id, package_index);
+
+CREATE TABLE IF NOT EXISTS client_sync_supersedence (
+    superseding_package_index INTEGER NOT NULL,
+    superseded_update_id TEXT NOT NULL,
+    PRIMARY KEY(superseding_package_index, superseded_update_id),
+    FOREIGN KEY(superseding_package_index) REFERENCES packages(package_index) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_client_sync_supersedence_target
+ON client_sync_supersedence(superseded_update_id, superseding_package_index);
+
+CREATE TABLE IF NOT EXISTS client_sync_bundles (
+    bundle_package_index INTEGER NOT NULL,
+    bundled_update_id TEXT NOT NULL,
+    bundled_revision_number INTEGER NOT NULL,
+    PRIMARY KEY(bundle_package_index, bundled_update_id, bundled_revision_number),
+    FOREIGN KEY(bundle_package_index) REFERENCES packages(package_index) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_client_sync_bundles_target
+ON client_sync_bundles(bundled_update_id, bundled_revision_number, bundle_package_index);
+
+CREATE TABLE IF NOT EXISTS client_sync_driver_hardware_ids (
+    package_index INTEGER NOT NULL,
+    metadata_ordinal INTEGER NOT NULL,
+    hardware_id TEXT NOT NULL,
+    PRIMARY KEY(package_index, metadata_ordinal),
+    FOREIGN KEY(package_index) REFERENCES packages(package_index) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_client_sync_driver_hardware_id
+ON client_sync_driver_hardware_ids(hardware_id, package_index, metadata_ordinal);
 
 CREATE TABLE IF NOT EXISTS store_blobs (
     key TEXT PRIMARY KEY,
@@ -236,6 +318,118 @@ CREATE TABLE IF NOT EXISTS sync_checkpoint_items (
 
 CREATE INDEX IF NOT EXISTS idx_sync_checkpoint_items_pending
 ON sync_checkpoint_items(checkpoint_id, completed, ordinal);
+
+CREATE TABLE IF NOT EXISTS driver_sync_identifier_anchors (
+    scope_key TEXT NOT NULL,
+    identifier_type INTEGER NOT NULL,
+    identifier TEXT NOT NULL,
+    anchor TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(scope_key, identifier_type, identifier)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_driver_sync_identifier_anchors_scope_anchor
+ON driver_sync_identifier_anchors(scope_key, anchor);
+
+CREATE TABLE IF NOT EXISTS driver_sync_checkpoint_scopes (
+    anchor_key TEXT PRIMARY KEY,
+    scope_key TEXT NOT NULL,
+    FOREIGN KEY(anchor_key) REFERENCES sync_checkpoints(anchor_key) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_driver_sync_checkpoint_scopes_scope
+ON driver_sync_checkpoint_scopes(scope_key);
+
+CREATE TABLE IF NOT EXISTS driver_sync_checkpoint_members (
+    anchor_key TEXT NOT NULL,
+    identifier_type INTEGER NOT NULL,
+    identifier TEXT NOT NULL,
+    PRIMARY KEY(anchor_key, identifier_type, identifier),
+    FOREIGN KEY(anchor_key) REFERENCES driver_sync_checkpoint_scopes(anchor_key) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS observed_detectoids (
+    update_id TEXT NOT NULL,
+    revision_number INTEGER NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    observation_count INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY(update_id, revision_number)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_observed_detectoids_last_seen
+ON observed_detectoids(last_seen);
+
+CREATE TABLE IF NOT EXISTS observed_pnp_hardware_ids (
+    hardware_id TEXT PRIMARY KEY,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    observation_count INTEGER NOT NULL DEFAULT 1
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_observed_pnp_hardware_ids_last_seen
+ON observed_pnp_hardware_ids(last_seen);
+
+CREATE TABLE IF NOT EXISTS observed_compatible_ids (
+    compatible_id TEXT PRIMARY KEY,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    observation_count INTEGER NOT NULL DEFAULT 1
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_observed_compatible_ids_last_seen
+ON observed_compatible_ids(last_seen);
+
+CREATE TABLE IF NOT EXISTS observed_computer_ids (
+    computer_id TEXT PRIMARY KEY,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    observation_count INTEGER NOT NULL DEFAULT 1
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_observed_computer_ids_last_seen
+ON observed_computer_ids(last_seen);
+
+CREATE TABLE IF NOT EXISTS detectoid_product_map (
+    detectoid_update_id TEXT NOT NULL,
+    product_category_id TEXT NOT NULL,
+    source_flags INTEGER NOT NULL,
+    PRIMARY KEY(detectoid_update_id, product_category_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_detectoid_product_map_product
+ON detectoid_product_map(product_category_id);
+
+CREATE TABLE IF NOT EXISTS observed_fetch_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT NULL,
+    status INTEGER NOT NULL,
+    seen_within_days INTEGER NOT NULL,
+    include_products INTEGER NOT NULL CHECK(include_products IN (0, 1)),
+    include_drivers INTEGER NOT NULL CHECK(include_drivers IN (0, 1)),
+    include_compatible_ids INTEGER NOT NULL CHECK(include_compatible_ids IN (0, 1)),
+    dry_run INTEGER NOT NULL CHECK(dry_run IN (0, 1)),
+    package_count_before INTEGER NOT NULL,
+    package_count_after INTEGER NULL,
+    summary TEXT NULL,
+    error TEXT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_observed_fetch_runs_started_at
+ON observed_fetch_runs(started_at DESC);
+
+INSERT OR IGNORE INTO store_properties(key, value)
+VALUES ('catalog_generation', '0');
+
+INSERT OR IGNORE INTO store_properties(key, value)
+VALUES ('catalog_last_changed', '1970-01-01T00:00:00.0000000+00:00');
+
+INSERT OR IGNORE INTO store_properties(key, value)
+VALUES ('catalog_publication_deferred', '0');
+
+INSERT OR IGNORE INTO store_properties(key, value)
+VALUES ('catalog_unpublished_changes', '0');
 ");
 
             using var command = Connection.CreateCommand();
@@ -247,46 +441,82 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
             command.ExecuteNonQuery();
         }
 
-        private void EnsureCompressionSchema()
+        private void ValidateExistingSchema()
         {
-            EnsureColumnExists("packages", "metadata_compression", "TEXT NOT NULL DEFAULT 'none'");
-            EnsureColumnExists("packages", "files_blob", "BLOB NULL");
-            EnsureColumnExists("packages", "files_compression", "TEXT NULL");
-            EnsureColumnExists("file_locations", "file_blob", "BLOB NULL");
-            EnsureColumnExists("file_locations", "file_compression", "TEXT NULL");
-            EnsureColumnExists("sync_checkpoints", "total_items", "INTEGER NOT NULL DEFAULT 0");
-            EnsureColumnExists("sync_checkpoints", "completed_items", "INTEGER NOT NULL DEFAULT 0");
-
-            ExecuteNonQuery(@"
-UPDATE sync_checkpoints
-SET total_items = (
-        SELECT COUNT(*)
-        FROM sync_checkpoint_items
-        WHERE sync_checkpoint_items.checkpoint_id = sync_checkpoints.checkpoint_id
-    ),
-    completed_items = (
-        SELECT COUNT(*)
-        FROM sync_checkpoint_items
-        WHERE sync_checkpoint_items.checkpoint_id = sync_checkpoints.checkpoint_id
-          AND sync_checkpoint_items.completed = 1
-    );
-
-INSERT OR IGNORE INTO package_file_map(package_index, sha1_base64)
-SELECT package_index, sha1_base64
-FROM file_locations
-WHERE package_index IS NOT NULL;");
-
-            _FileLocationFileJsonIsRequired = IsColumnNotNull("file_locations", "file_json");
-        }
-
-        private void EnsureColumnExists(string tableName, string columnName, string columnDefinition)
-        {
-            if (ColumnExists(tableName, columnName))
+            using (var tableCommand = Connection.CreateCommand())
             {
-                return;
+                tableCommand.CommandText = @"
+SELECT COUNT(*)
+FROM sqlite_schema
+WHERE type = 'table'
+  AND name = 'store_properties';";
+                if (Convert.ToInt32(
+                        tableCommand.ExecuteScalar(),
+                        CultureInfo.InvariantCulture) != 1)
+                {
+                    throw new InvalidDataException(
+                        "Unsupported SQLite metadata store. Delete metadata.sqlite and run pre-fetch again.");
+                }
             }
 
-            ExecuteNonQuery($"ALTER TABLE {tableName} ADD COLUMN {columnName} {columnDefinition};");
+            var schemaVersion = ReadProperty("schema_version");
+            if (!string.Equals(
+                    schemaVersion,
+                    SchemaVersion.ToString(CultureInfo.InvariantCulture),
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    $"Unsupported SQLite metadata schema '{schemaVersion ?? "missing"}'. " +
+                    $"Delete metadata.sqlite and run pre-fetch again with schema {SchemaVersion}.");
+            }
+
+            var requiredTables = new[]
+            {
+                "packages",
+                "client_sync_packages",
+                "client_sync_prerequisites",
+                "client_sync_supersedence",
+                "client_sync_bundles",
+                "client_sync_driver_hardware_ids",
+                "file_locations",
+                "package_file_map",
+                "observed_detectoids",
+                "observed_pnp_hardware_ids",
+                "observed_compatible_ids",
+                "observed_computer_ids"
+            };
+
+            using (var command = Connection.CreateCommand())
+            {
+                command.CommandText = @"
+SELECT COUNT(*)
+FROM sqlite_schema
+WHERE type = 'table'
+  AND name = $tableName;";
+                var parameter = command.Parameters.Add("$tableName", SqliteType.Text);
+                command.Prepare();
+                foreach (var tableName in requiredTables)
+                {
+                    parameter.Value = tableName;
+                    if (Convert.ToInt32(
+                            command.ExecuteScalar(),
+                            CultureInfo.InvariantCulture) != 1)
+                    {
+                        throw new InvalidDataException(
+                            $"SQLite metadata schema {SchemaVersion} is incomplete: " +
+                            $"missing table '{tableName}'. Delete metadata.sqlite and run pre-fetch again.");
+                    }
+                }
+            }
+
+            if (!ColumnExists("packages", "published"))
+            {
+                throw new InvalidDataException(
+                    "SQLite metadata schema is missing packages.published. " +
+                    "Delete metadata.sqlite and run pre-fetch again.");
+            }
+
+            _FileLocationFileJsonIsRequired = false;
         }
 
         private bool ColumnExists(string tableName, string columnName)
@@ -299,22 +529,6 @@ WHERE package_index IS NOT NULL;");
                 if (string.Equals(reader.GetString(1), columnName, StringComparison.OrdinalIgnoreCase))
                 {
                     return true;
-                }
-            }
-
-            return false;
-        }
-
-        private bool IsColumnNotNull(string tableName, string columnName)
-        {
-            using var command = Connection.CreateCommand();
-            command.CommandText = $"PRAGMA table_info({tableName});";
-            using var reader = command.ExecuteReader();
-            while (reader.Read())
-            {
-                if (string.Equals(reader.GetString(1), columnName, StringComparison.OrdinalIgnoreCase))
-                {
-                    return reader.GetInt32(3) != 0;
                 }
             }
 
@@ -435,6 +649,141 @@ ORDER BY package_index;";
             return value == null || value == DBNull.Value ? null : (string)value;
         }
 
+        private MetadataStoreGenerationInfo ReadMetadataGenerationInfo()
+        {
+            long generation = 0;
+            var generationValue = ReadProperty("catalog_generation");
+            if (!string.IsNullOrWhiteSpace(generationValue))
+            {
+                long.TryParse(
+                    generationValue,
+                    NumberStyles.Integer,
+                    CultureInfo.InvariantCulture,
+                    out generation);
+            }
+
+            var lastChanged = DateTimeOffset.MinValue;
+            var lastChangedValue = ReadProperty("catalog_last_changed");
+            if (!string.IsNullOrWhiteSpace(lastChangedValue)
+                && DateTimeOffset.TryParse(
+                    lastChangedValue,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind,
+                    out var parsedLastChanged))
+            {
+                lastChanged = parsedLastChanged.ToUniversalTime();
+            }
+
+            return new MetadataStoreGenerationInfo(
+                generation,
+                lastChanged,
+                string.Equals(
+                    ReadProperty(CatalogPublicationDeferredKey),
+                    "1",
+                    StringComparison.Ordinal),
+                string.Equals(
+                    ReadProperty(CatalogUnpublishedChangesKey),
+                    "1",
+                    StringComparison.Ordinal));
+        }
+
+        private MetadataStoreGenerationInfo PublishCatalogGeneration()
+        {
+            var changedAt = DateTimeOffset.UtcNow;
+            var changedAtText = changedAt.ToString("O", CultureInfo.InvariantCulture);
+
+            using var transaction = Connection.BeginTransaction();
+            using (var publishPackagesCommand = Connection.CreateCommand())
+            {
+                publishPackagesCommand.Transaction = transaction;
+                publishPackagesCommand.CommandText = @"
+UPDATE packages
+SET published = 1
+WHERE published = 0;";
+                publishPackagesCommand.ExecuteNonQuery();
+            }
+
+            using (var generationCommand = Connection.CreateCommand())
+            {
+                generationCommand.Transaction = transaction;
+                generationCommand.CommandText = @"
+INSERT INTO store_properties(key, value)
+VALUES ('catalog_generation', '1')
+ON CONFLICT(key) DO UPDATE SET
+    value = CAST(CAST(store_properties.value AS INTEGER) + 1 AS TEXT);";
+                generationCommand.ExecuteNonQuery();
+            }
+
+            using (var timestampCommand = Connection.CreateCommand())
+            {
+                timestampCommand.Transaction = transaction;
+                timestampCommand.CommandText = @"
+INSERT INTO store_properties(key, value)
+VALUES ('catalog_last_changed', $changedAt)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
+                timestampCommand.Parameters.AddWithValue("$changedAt", changedAtText);
+                timestampCommand.ExecuteNonQuery();
+            }
+
+            using (var publicationStateCommand = Connection.CreateCommand())
+            {
+                publicationStateCommand.Transaction = transaction;
+                publicationStateCommand.CommandText = @"
+INSERT INTO store_properties(key, value)
+VALUES ($deferredKey, '0'), ($unpublishedKey, '0')
+ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
+                publicationStateCommand.Parameters.AddWithValue(
+                    "$deferredKey",
+                    CatalogPublicationDeferredKey);
+                publicationStateCommand.Parameters.AddWithValue(
+                    "$unpublishedKey",
+                    CatalogUnpublishedChangesKey);
+                publicationStateCommand.ExecuteNonQuery();
+            }
+
+            long generation;
+            using (var readCommand = Connection.CreateCommand())
+            {
+                readCommand.Transaction = transaction;
+                readCommand.CommandText = @"
+SELECT CAST(value AS INTEGER)
+FROM store_properties
+WHERE key = 'catalog_generation';";
+                generation = Convert.ToInt64(
+                    readCommand.ExecuteScalar(),
+                    CultureInfo.InvariantCulture);
+            }
+
+            transaction.Commit();
+            IsCatalogGenerationPublicationDeferred = false;
+            return new MetadataStoreGenerationInfo(
+                generation,
+                changedAt,
+                publicationDeferred: false,
+                hasUnpublishedChanges: false);
+        }
+
+        private void PersistUnpublishedCatalogChanges()
+        {
+            WriteProperty(CatalogUnpublishedChangesKey, "1");
+        }
+
+        private void ClearCatalogPublicationState()
+        {
+            using var transaction = Connection.BeginTransaction();
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+INSERT INTO store_properties(key, value)
+VALUES ($deferredKey, '0'), ($unpublishedKey, '0')
+ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
+            command.Parameters.AddWithValue("$deferredKey", CatalogPublicationDeferredKey);
+            command.Parameters.AddWithValue("$unpublishedKey", CatalogUnpublishedChangesKey);
+            command.ExecuteNonQuery();
+            transaction.Commit();
+            IsCatalogGenerationPublicationDeferred = false;
+        }
+
         private void WriteProperty(string key, string value)
         {
             using var command = Connection.CreateCommand();
@@ -475,6 +824,1010 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
             using var command = Connection.CreateCommand();
             command.CommandText = sql;
             command.ExecuteNonQuery();
+        }
+
+        // Observed client inventory support. These operations are local-only and
+        // never contact an upstream update service.
+        public void RecordObservedInventory(ObservedInventoryBatch observations)
+        {
+            if (observations == null || observations.IsEmpty)
+            {
+                return;
+            }
+
+            var observedAt = observations.ObservedAt
+                .ToUniversalTime()
+                .ToString("O", CultureInfo.InvariantCulture);
+
+            var detectoids = observations.Detectoids
+                .Where(value => value != null
+                    && value.UpdateId != Guid.Empty
+                    && value.RevisionNumber >= 0)
+                .GroupBy(value => new { value.UpdateId, value.RevisionNumber })
+                .Select(group => group.First())
+                .Take(MaxObservedValuesPerType)
+                .ToList();
+            var pnpHardwareIds = NormalizeObservedIdentifiers(observations.PnpHardwareIds);
+            var compatibleIds = NormalizeObservedIdentifiers(observations.CompatibleIds);
+            var computerIds = observations.ComputerIds
+                .Where(value => value != Guid.Empty)
+                .Distinct()
+                .Take(MaxObservedValuesPerType)
+                .Select(value => value.ToString("D"))
+                .ToList();
+
+            if (detectoids.Count == 0
+                && pnpHardwareIds.Count == 0
+                && compatibleIds.Count == 0
+                && computerIds.Count == 0)
+            {
+                return;
+            }
+
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var transaction = Connection.BeginTransaction();
+                UpsertObservedDetectoids(transaction, detectoids, observedAt);
+                UpsertObservedStringIdentifiers(
+                    transaction,
+                    "observed_pnp_hardware_ids",
+                    "hardware_id",
+                    pnpHardwareIds,
+                    observedAt);
+                UpsertObservedStringIdentifiers(
+                    transaction,
+                    "observed_compatible_ids",
+                    "compatible_id",
+                    compatibleIds,
+                    observedAt);
+                UpsertObservedStringIdentifiers(
+                    transaction,
+                    "observed_computer_ids",
+                    "computer_id",
+                    computerIds,
+                    observedAt);
+                transaction.Commit();
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public IReadOnlyList<ObservedDetectoidObservation> GetObservedDetectoids(
+            DateTimeOffset? seenSince = null)
+        {
+            StateLock.EnterReadLock();
+            try
+            {
+                var result = new List<ObservedDetectoidObservation>();
+                using var command = Connection.CreateCommand();
+                command.CommandText = @"
+SELECT update_id, revision_number, first_seen, last_seen, observation_count
+FROM observed_detectoids
+WHERE $seenSince IS NULL OR last_seen >= $seenSince
+ORDER BY last_seen DESC, update_id, revision_number;";
+                AddObservedSeenSinceParameter(command, seenSince);
+
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    if (!Guid.TryParse(reader.GetString(0), out var updateId))
+                    {
+                        continue;
+                    }
+
+                    result.Add(new ObservedDetectoidObservation(
+                        updateId,
+                        reader.GetInt32(1),
+                        ParseCheckpointTimestamp(reader.GetString(2)),
+                        ParseCheckpointTimestamp(reader.GetString(3)),
+                        reader.GetInt64(4)));
+                }
+
+                return result;
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        public IReadOnlyList<ObservedIdentifierObservation> GetObservedPnpHardwareIds(
+            DateTimeOffset? seenSince = null)
+        {
+            StateLock.EnterReadLock();
+            try
+            {
+                return ReadObservedStringIdentifiers(
+                    "observed_pnp_hardware_ids",
+                    "hardware_id",
+                    seenSince);
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        public IReadOnlyList<ObservedIdentifierObservation> GetObservedCompatibleIds(
+            DateTimeOffset? seenSince = null)
+        {
+            StateLock.EnterReadLock();
+            try
+            {
+                return ReadObservedStringIdentifiers(
+                    "observed_compatible_ids",
+                    "compatible_id",
+                    seenSince);
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        public IReadOnlyList<ObservedComputerIdObservation> GetObservedComputerIds(
+            DateTimeOffset? seenSince = null)
+        {
+            StateLock.EnterReadLock();
+            try
+            {
+                var result = new List<ObservedComputerIdObservation>();
+                using var command = Connection.CreateCommand();
+                command.CommandText = @"
+SELECT computer_id, first_seen, last_seen, observation_count
+FROM observed_computer_ids
+WHERE $seenSince IS NULL OR last_seen >= $seenSince
+ORDER BY last_seen DESC, computer_id;";
+                AddObservedSeenSinceParameter(command, seenSince);
+
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    if (!Guid.TryParse(reader.GetString(0), out var computerId))
+                    {
+                        continue;
+                    }
+
+                    result.Add(new ObservedComputerIdObservation(
+                        computerId,
+                        ParseCheckpointTimestamp(reader.GetString(1)),
+                        ParseCheckpointTimestamp(reader.GetString(2)),
+                        reader.GetInt64(3)));
+                }
+
+                return result;
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        public ObservedInventoryStatus GetObservedInventoryStatus(DateTimeOffset? seenSince = null)
+        {
+            var normalizedSeenSince = seenSince?.ToUniversalTime();
+
+            StateLock.EnterReadLock();
+            try
+            {
+                return new ObservedInventoryStatus(
+                    normalizedSeenSince,
+                    ReadObservedInventoryKindStatus("observed_detectoids", normalizedSeenSince),
+                    ReadObservedInventoryKindStatus("observed_pnp_hardware_ids", normalizedSeenSince),
+                    ReadObservedInventoryKindStatus("observed_compatible_ids", normalizedSeenSince),
+                    ReadObservedInventoryKindStatus("observed_computer_ids", normalizedSeenSince));
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        public void ReplaceDetectoidProductMappings(
+            IEnumerable<DetectoidProductMapping> mappings,
+            DateTimeOffset rebuiltAt)
+        {
+            var normalizedMappings = (mappings ?? Array.Empty<DetectoidProductMapping>())
+                .Where(mapping => mapping != null
+                    && mapping.DetectoidUpdateId != Guid.Empty
+                    && mapping.ProductCategoryId != Guid.Empty
+                    && mapping.Source != DetectoidProductMappingSource.None)
+                .GroupBy(mapping => new
+                {
+                    mapping.DetectoidUpdateId,
+                    mapping.ProductCategoryId
+                })
+                .Select(group => new DetectoidProductMapping(
+                    group.Key.DetectoidUpdateId,
+                    group.Key.ProductCategoryId,
+                    group.Aggregate(
+                        DetectoidProductMappingSource.None,
+                        (flags, mapping) => flags | mapping.Source)))
+                .OrderBy(mapping => mapping.DetectoidUpdateId)
+                .ThenBy(mapping => mapping.ProductCategoryId)
+                .ToList();
+
+            var normalizedRebuiltAt = rebuiltAt == default
+                ? DateTimeOffset.UtcNow
+                : rebuiltAt.ToUniversalTime();
+            var rebuiltAtText = normalizedRebuiltAt.ToString("O", CultureInfo.InvariantCulture);
+
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var transaction = Connection.BeginTransaction();
+
+                using (var deleteCommand = Connection.CreateCommand())
+                {
+                    deleteCommand.Transaction = transaction;
+                    deleteCommand.CommandText = "DELETE FROM detectoid_product_map;";
+                    deleteCommand.ExecuteNonQuery();
+                }
+
+                if (normalizedMappings.Count > 0)
+                {
+                    using var insertCommand = Connection.CreateCommand();
+                    insertCommand.Transaction = transaction;
+                    insertCommand.CommandText = @"
+INSERT INTO detectoid_product_map(
+    detectoid_update_id,
+    product_category_id,
+    source_flags)
+VALUES ($detectoidUpdateId, $productCategoryId, $sourceFlags);";
+                    var detectoidParameter = insertCommand.Parameters.Add("$detectoidUpdateId", SqliteType.Text);
+                    var productParameter = insertCommand.Parameters.Add("$productCategoryId", SqliteType.Text);
+                    var sourceParameter = insertCommand.Parameters.Add("$sourceFlags", SqliteType.Integer);
+                    insertCommand.Prepare();
+
+                    foreach (var mapping in normalizedMappings)
+                    {
+                        detectoidParameter.Value = mapping.DetectoidUpdateId.ToString("D");
+                        productParameter.Value = mapping.ProductCategoryId.ToString("D");
+                        sourceParameter.Value = (int)mapping.Source;
+                        insertCommand.ExecuteNonQuery();
+                    }
+                }
+
+                using (var stateCommand = Connection.CreateCommand())
+                {
+                    stateCommand.Transaction = transaction;
+                    stateCommand.CommandText = @"
+INSERT INTO store_properties(key, value)
+VALUES ('detectoid_product_map_rebuilt_at', $rebuiltAt)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
+                    stateCommand.Parameters.AddWithValue("$rebuiltAt", rebuiltAtText);
+                    stateCommand.ExecuteNonQuery();
+                }
+
+                transaction.Commit();
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public IReadOnlyList<ObservedProductCategory> GetObservedProductCategories(
+            DateTimeOffset? seenSince = null)
+        {
+            StateLock.EnterReadLock();
+            try
+            {
+                var result = new List<ObservedProductCategory>();
+                using var command = Connection.CreateCommand();
+                command.CommandText = @"
+WITH active_detectoids AS (
+    SELECT
+        update_id,
+        MAX(last_seen) AS last_seen,
+        SUM(observation_count) AS observation_count
+    FROM observed_detectoids
+    WHERE $seenSince IS NULL OR last_seen >= $seenSince
+    GROUP BY update_id
+)
+SELECT
+    mapping.product_category_id,
+    MAX(active.last_seen) AS last_seen,
+    COUNT(DISTINCT active.update_id) AS detectoid_count,
+    SUM(active.observation_count) AS observation_count
+FROM active_detectoids AS active
+JOIN detectoid_product_map AS mapping
+  ON mapping.detectoid_update_id = active.update_id
+GROUP BY mapping.product_category_id
+ORDER BY last_seen DESC, mapping.product_category_id;";
+                AddObservedSeenSinceParameter(command, seenSince);
+
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    if (!Guid.TryParse(reader.GetString(0), out var productCategoryId))
+                    {
+                        continue;
+                    }
+
+                    result.Add(new ObservedProductCategory(
+                        productCategoryId,
+                        ParseCheckpointTimestamp(reader.GetString(1)),
+                        reader.GetInt64(2),
+                        reader.GetInt64(3)));
+                }
+
+                return result;
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        public DetectoidProductMapStatus GetDetectoidProductMapStatus(
+            DateTimeOffset? seenSince = null)
+        {
+            StateLock.EnterReadLock();
+            try
+            {
+                long mappingCount;
+                long mappedDetectoidCount;
+                long productCount;
+                using (var mappingCommand = Connection.CreateCommand())
+                {
+                    mappingCommand.CommandText = @"
+SELECT
+    COUNT(*),
+    COUNT(DISTINCT detectoid_update_id),
+    COUNT(DISTINCT product_category_id)
+FROM detectoid_product_map;";
+                    using var reader = mappingCommand.ExecuteReader();
+                    reader.Read();
+                    mappingCount = reader.GetInt64(0);
+                    mappedDetectoidCount = reader.GetInt64(1);
+                    productCount = reader.GetInt64(2);
+                }
+
+                long activeMappedDetectoidCount;
+                long activeUnmappedDetectoidCount;
+                using (var activeCommand = Connection.CreateCommand())
+                {
+                    activeCommand.CommandText = @"
+WITH active_detectoids AS (
+    SELECT DISTINCT update_id
+    FROM observed_detectoids
+    WHERE $seenSince IS NULL OR last_seen >= $seenSince
+)
+SELECT
+    COALESCE(SUM(CASE WHEN EXISTS (
+        SELECT 1
+        FROM detectoid_product_map AS mapping
+        WHERE mapping.detectoid_update_id = active.update_id
+    ) THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM detectoid_product_map AS mapping
+        WHERE mapping.detectoid_update_id = active.update_id
+    ) THEN 1 ELSE 0 END), 0)
+FROM active_detectoids AS active;";
+                    AddObservedSeenSinceParameter(activeCommand, seenSince);
+                    using var reader = activeCommand.ExecuteReader();
+                    reader.Read();
+                    activeMappedDetectoidCount = reader.GetInt64(0);
+                    activeUnmappedDetectoidCount = reader.GetInt64(1);
+                }
+
+                DateTimeOffset? rebuiltAt = null;
+                var rebuiltAtValue = ReadProperty("detectoid_product_map_rebuilt_at");
+                if (!string.IsNullOrWhiteSpace(rebuiltAtValue))
+                {
+                    rebuiltAt = ParseCheckpointTimestamp(rebuiltAtValue);
+                }
+
+                return new DetectoidProductMapStatus(
+                    mappingCount,
+                    mappedDetectoidCount,
+                    productCount,
+                    activeMappedDetectoidCount,
+                    activeUnmappedDetectoidCount,
+                    rebuiltAt);
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        public long PruneObservedInventory(DateTimeOffset olderThan)
+        {
+            var cutoff = olderThan
+                .ToUniversalTime()
+                .ToString("O", CultureInfo.InvariantCulture);
+
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var transaction = Connection.BeginTransaction();
+                long deleted = 0;
+                deleted += DeleteObservedRows(transaction, "observed_detectoids", cutoff);
+                deleted += DeleteObservedRows(transaction, "observed_pnp_hardware_ids", cutoff);
+                deleted += DeleteObservedRows(transaction, "observed_compatible_ids", cutoff);
+                deleted += DeleteObservedRows(transaction, "observed_computer_ids", cutoff);
+                transaction.Commit();
+                TryReclaimCheckpointStorage();
+                return deleted;
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public long StartObservedFetchRun(
+            DateTimeOffset startedAt,
+            int seenWithinDays,
+            bool includeProducts,
+            bool includeDrivers,
+            bool includeCompatibleIds,
+            bool dryRun,
+            long packageCountBefore)
+        {
+            var normalizedStartedAt = startedAt == default
+                ? DateTimeOffset.UtcNow
+                : startedAt.ToUniversalTime();
+            var startedAtText = normalizedStartedAt.ToString("O", CultureInfo.InvariantCulture);
+
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var transaction = Connection.BeginTransaction();
+
+                // A running row left by a terminated process can never complete.
+                // Close it explicitly before creating the next scheduled run.
+                using (var interruptedCommand = Connection.CreateCommand())
+                {
+                    interruptedCommand.Transaction = transaction;
+                    interruptedCommand.CommandText = @"
+UPDATE observed_fetch_runs
+SET completed_at = $completedAt,
+    status = $failedStatus,
+    error = COALESCE(error, 'The previous fetch-observed process ended before recording completion.')
+WHERE status = $runningStatus
+  AND completed_at IS NULL;";
+                    interruptedCommand.Parameters.AddWithValue("$completedAt", startedAtText);
+                    interruptedCommand.Parameters.AddWithValue("$failedStatus", (int)ObservedFetchRunStatus.Failed);
+                    interruptedCommand.Parameters.AddWithValue("$runningStatus", (int)ObservedFetchRunStatus.Running);
+                    interruptedCommand.ExecuteNonQuery();
+                }
+
+                using (var insertCommand = Connection.CreateCommand())
+                {
+                    insertCommand.Transaction = transaction;
+                    insertCommand.CommandText = @"
+INSERT INTO observed_fetch_runs(
+    started_at,
+    completed_at,
+    status,
+    seen_within_days,
+    include_products,
+    include_drivers,
+    include_compatible_ids,
+    dry_run,
+    package_count_before,
+    package_count_after,
+    summary,
+    error)
+VALUES (
+    $startedAt,
+    NULL,
+    $status,
+    $seenWithinDays,
+    $includeProducts,
+    $includeDrivers,
+    $includeCompatibleIds,
+    $dryRun,
+    $packageCountBefore,
+    NULL,
+    NULL,
+    NULL);";
+                    insertCommand.Parameters.AddWithValue("$startedAt", startedAtText);
+                    insertCommand.Parameters.AddWithValue("$status", (int)ObservedFetchRunStatus.Running);
+                    insertCommand.Parameters.AddWithValue("$seenWithinDays", Math.Max(0, seenWithinDays));
+                    insertCommand.Parameters.AddWithValue("$includeProducts", includeProducts ? 1 : 0);
+                    insertCommand.Parameters.AddWithValue("$includeDrivers", includeDrivers ? 1 : 0);
+                    insertCommand.Parameters.AddWithValue("$includeCompatibleIds", includeCompatibleIds ? 1 : 0);
+                    insertCommand.Parameters.AddWithValue("$dryRun", dryRun ? 1 : 0);
+                    insertCommand.Parameters.AddWithValue("$packageCountBefore", Math.Max(0, packageCountBefore));
+                    insertCommand.ExecuteNonQuery();
+                }
+
+                long runId;
+                using (var idCommand = Connection.CreateCommand())
+                {
+                    idCommand.Transaction = transaction;
+                    idCommand.CommandText = "SELECT last_insert_rowid();";
+                    runId = Convert.ToInt64(idCommand.ExecuteScalar(), CultureInfo.InvariantCulture);
+                }
+
+                using (var retentionCommand = Connection.CreateCommand())
+                {
+                    retentionCommand.Transaction = transaction;
+                    retentionCommand.CommandText = @"
+DELETE FROM observed_fetch_runs
+WHERE run_id NOT IN (
+    SELECT run_id
+    FROM observed_fetch_runs
+    ORDER BY run_id DESC
+    LIMIT 100
+);";
+                    retentionCommand.ExecuteNonQuery();
+                }
+
+                transaction.Commit();
+                return runId;
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public void CompleteObservedFetchRun(
+            long runId,
+            DateTimeOffset completedAt,
+            ObservedFetchRunStatus status,
+            long packageCountAfter,
+            string summary,
+            string error)
+        {
+            if (runId <= 0)
+            {
+                return;
+            }
+
+            var normalizedCompletedAt = completedAt == default
+                ? DateTimeOffset.UtcNow
+                : completedAt.ToUniversalTime();
+
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var command = Connection.CreateCommand();
+                command.CommandText = @"
+UPDATE observed_fetch_runs
+SET completed_at = $completedAt,
+    status = $status,
+    package_count_after = $packageCountAfter,
+    summary = $summary,
+    error = $error
+WHERE run_id = $runId;";
+                command.Parameters.AddWithValue("$runId", runId);
+                command.Parameters.AddWithValue(
+                    "$completedAt",
+                    normalizedCompletedAt.ToString("O", CultureInfo.InvariantCulture));
+                command.Parameters.AddWithValue("$status", (int)status);
+                command.Parameters.AddWithValue("$packageCountAfter", Math.Max(0, packageCountAfter));
+                command.Parameters.AddWithValue(
+                    "$summary",
+                    string.IsNullOrWhiteSpace(summary) ? DBNull.Value : summary);
+                command.Parameters.AddWithValue(
+                    "$error",
+                    string.IsNullOrWhiteSpace(error) ? DBNull.Value : error);
+                command.ExecuteNonQuery();
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public IReadOnlyList<ObservedFetchRunInfo> GetObservedFetchRuns(int maxCount)
+        {
+            var limit = Math.Max(0, Math.Min(maxCount, 100));
+            if (limit == 0)
+            {
+                return Array.Empty<ObservedFetchRunInfo>();
+            }
+
+            StateLock.EnterReadLock();
+            try
+            {
+                var result = new List<ObservedFetchRunInfo>();
+                using var command = Connection.CreateCommand();
+                command.CommandText = @"
+SELECT
+    run_id,
+    started_at,
+    completed_at,
+    status,
+    seen_within_days,
+    include_products,
+    include_drivers,
+    include_compatible_ids,
+    dry_run,
+    package_count_before,
+    package_count_after,
+    summary,
+    error
+FROM observed_fetch_runs
+ORDER BY run_id DESC
+LIMIT $limit;";
+                command.Parameters.AddWithValue("$limit", limit);
+
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    result.Add(new ObservedFetchRunInfo(
+                        reader.GetInt64(0),
+                        ParseCheckpointTimestamp(reader.GetString(1)),
+                        reader.IsDBNull(2)
+                            ? null
+                            : ParseCheckpointTimestamp(reader.GetString(2)),
+                        Enum.IsDefined(typeof(ObservedFetchRunStatus), reader.GetInt32(3))
+                            ? (ObservedFetchRunStatus)reader.GetInt32(3)
+                            : ObservedFetchRunStatus.Failed,
+                        reader.GetInt32(4),
+                        reader.GetInt32(5) != 0,
+                        reader.GetInt32(6) != 0,
+                        reader.GetInt32(7) != 0,
+                        reader.GetInt32(8) != 0,
+                        reader.GetInt64(9),
+                        reader.IsDBNull(10) ? null : reader.GetInt64(10),
+                        reader.IsDBNull(11) ? null : reader.GetString(11),
+                        reader.IsDBNull(12) ? null : reader.GetString(12)));
+                }
+
+                return result;
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        public ObservedSyncOperationalStatus GetObservedSyncOperationalStatus()
+        {
+            StateLock.EnterReadLock();
+            try
+            {
+                long productAnchorCount;
+                using (var anchorCommand = Connection.CreateCommand())
+                {
+                    anchorCommand.CommandText = @"
+SELECT COUNT(*)
+FROM store_properties
+WHERE key LIKE 'sync-anchor:mu:%';";
+                    productAnchorCount = Convert.ToInt64(
+                        anchorCommand.ExecuteScalar(),
+                        CultureInfo.InvariantCulture);
+                }
+
+                long driverAnchorCount;
+                using (var driverCommand = Connection.CreateCommand())
+                {
+                    driverCommand.CommandText = "SELECT COUNT(*) FROM driver_sync_identifier_anchors;";
+                    driverAnchorCount = Convert.ToInt64(
+                        driverCommand.ExecuteScalar(),
+                        CultureInfo.InvariantCulture);
+                }
+
+                using var checkpointCommand = Connection.CreateCommand();
+                checkpointCommand.CommandText = @"
+SELECT
+    COUNT(*),
+    COALESCE(SUM(total_items - completed_items), 0),
+    COALESCE(SUM(completed_items), 0),
+    MIN(created_at),
+    MAX(updated_at)
+FROM sync_checkpoints;";
+                using var reader = checkpointCommand.ExecuteReader();
+                reader.Read();
+                return new ObservedSyncOperationalStatus(
+                    productAnchorCount,
+                    driverAnchorCount,
+                    reader.GetInt64(0),
+                    reader.GetInt64(1),
+                    reader.GetInt64(2),
+                    reader.IsDBNull(3) ? null : ParseCheckpointTimestamp(reader.GetString(3)),
+                    reader.IsDBNull(4) ? null : ParseCheckpointTimestamp(reader.GetString(4)));
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        public long PruneInactiveDriverSyncState(DateTimeOffset olderThan)
+        {
+            var cutoff = olderThan
+                .ToUniversalTime()
+                .ToString("O", CultureInfo.InvariantCulture);
+
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var command = Connection.CreateCommand();
+                command.CommandText = @"
+DELETE FROM driver_sync_identifier_anchors AS anchor
+WHERE anchor.updated_at < $cutoff
+  AND NOT EXISTS (
+      SELECT 1
+      FROM driver_sync_checkpoint_members AS member
+      WHERE member.identifier_type = anchor.identifier_type
+        AND member.identifier = anchor.identifier
+  )
+  AND (
+      (
+          anchor.identifier_type = 1
+          AND NOT EXISTS (
+              SELECT 1
+              FROM observed_pnp_hardware_ids AS observed
+              WHERE observed.hardware_id = anchor.identifier
+                AND observed.last_seen >= $cutoff
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM observed_compatible_ids AS observed
+              WHERE observed.compatible_id = anchor.identifier
+                AND observed.last_seen >= $cutoff
+          )
+      )
+      OR
+      (
+          anchor.identifier_type = 2
+          AND NOT EXISTS (
+              SELECT 1
+              FROM observed_computer_ids AS observed
+              WHERE lower(observed.computer_id) = lower(anchor.identifier)
+                AND observed.last_seen >= $cutoff
+          )
+      )
+  );";
+                command.Parameters.AddWithValue("$cutoff", cutoff);
+                var deleted = command.ExecuteNonQuery();
+                TryReclaimCheckpointStorage();
+                return deleted;
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public long CountInactiveDriverSyncState(DateTimeOffset olderThan)
+        {
+            var cutoff = olderThan
+                .ToUniversalTime()
+                .ToString("O", CultureInfo.InvariantCulture);
+
+            StateLock.EnterReadLock();
+            try
+            {
+                using var command = Connection.CreateCommand();
+                command.CommandText = @"
+SELECT COUNT(*)
+FROM driver_sync_identifier_anchors AS anchor
+WHERE anchor.updated_at < $cutoff
+  AND NOT EXISTS (
+      SELECT 1
+      FROM driver_sync_checkpoint_members AS member
+      WHERE member.identifier_type = anchor.identifier_type
+        AND member.identifier = anchor.identifier
+  )
+  AND (
+      (
+          anchor.identifier_type = 1
+          AND NOT EXISTS (
+              SELECT 1
+              FROM observed_pnp_hardware_ids AS observed
+              WHERE observed.hardware_id = anchor.identifier
+                AND observed.last_seen >= $cutoff
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM observed_compatible_ids AS observed
+              WHERE observed.compatible_id = anchor.identifier
+                AND observed.last_seen >= $cutoff
+          )
+      )
+      OR
+      (
+          anchor.identifier_type = 2
+          AND NOT EXISTS (
+              SELECT 1
+              FROM observed_computer_ids AS observed
+              WHERE lower(observed.computer_id) = lower(anchor.identifier)
+                AND observed.last_seen >= $cutoff
+          )
+      )
+  );";
+                command.Parameters.AddWithValue("$cutoff", cutoff);
+                return Convert.ToInt64(
+                    command.ExecuteScalar(),
+                    CultureInfo.InvariantCulture);
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        private static List<string> NormalizeObservedIdentifiers(IEnumerable<string> identifiers)
+        {
+            return (identifiers ?? Array.Empty<string>())
+                .Select(NormalizeObservedIdentifier)
+                .Where(value => value != null)
+                .Distinct(StringComparer.Ordinal)
+                .Take(MaxObservedValuesPerType)
+                .ToList();
+        }
+
+        private static string NormalizeObservedIdentifier(string identifier)
+        {
+            if (string.IsNullOrWhiteSpace(identifier))
+            {
+                return null;
+            }
+
+            var normalized = identifier.Trim().ToUpperInvariant();
+            if (normalized.Length == 0
+                || normalized.Length > MaxObservedIdentifierLength
+                || normalized.Any(char.IsControl))
+            {
+                return null;
+            }
+
+            return normalized;
+        }
+
+        private void UpsertObservedDetectoids(
+            SqliteTransaction transaction,
+            IReadOnlyCollection<ObservedDetectoidIdentity> detectoids,
+            string observedAt)
+        {
+            if (detectoids.Count == 0)
+            {
+                return;
+            }
+
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+INSERT INTO observed_detectoids(
+    update_id,
+    revision_number,
+    first_seen,
+    last_seen,
+    observation_count)
+VALUES ($updateId, $revisionNumber, $observedAt, $observedAt, 1)
+ON CONFLICT(update_id, revision_number) DO UPDATE SET
+    first_seen = MIN(observed_detectoids.first_seen, excluded.first_seen),
+    last_seen = MAX(observed_detectoids.last_seen, excluded.last_seen),
+    observation_count = observed_detectoids.observation_count + 1;";
+            var updateIdParameter = command.Parameters.Add("$updateId", SqliteType.Text);
+            var revisionParameter = command.Parameters.Add("$revisionNumber", SqliteType.Integer);
+            var observedAtParameter = command.Parameters.Add("$observedAt", SqliteType.Text);
+            observedAtParameter.Value = observedAt;
+            command.Prepare();
+
+            foreach (var detectoid in detectoids)
+            {
+                updateIdParameter.Value = detectoid.UpdateId.ToString("D");
+                revisionParameter.Value = detectoid.RevisionNumber;
+                command.ExecuteNonQuery();
+            }
+        }
+
+        private void UpsertObservedStringIdentifiers(
+            SqliteTransaction transaction,
+            string tableName,
+            string columnName,
+            IReadOnlyCollection<string> identifiers,
+            string observedAt)
+        {
+            if (identifiers.Count == 0)
+            {
+                return;
+            }
+
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = $@"
+INSERT INTO {tableName}({columnName}, first_seen, last_seen, observation_count)
+VALUES ($identifier, $observedAt, $observedAt, 1)
+ON CONFLICT({columnName}) DO UPDATE SET
+    first_seen = MIN({tableName}.first_seen, excluded.first_seen),
+    last_seen = MAX({tableName}.last_seen, excluded.last_seen),
+    observation_count = {tableName}.observation_count + 1;";
+            var identifierParameter = command.Parameters.Add("$identifier", SqliteType.Text);
+            var observedAtParameter = command.Parameters.Add("$observedAt", SqliteType.Text);
+            observedAtParameter.Value = observedAt;
+            command.Prepare();
+
+            foreach (var identifier in identifiers)
+            {
+                identifierParameter.Value = identifier;
+                command.ExecuteNonQuery();
+            }
+        }
+
+        private IReadOnlyList<ObservedIdentifierObservation> ReadObservedStringIdentifiers(
+            string tableName,
+            string columnName,
+            DateTimeOffset? seenSince)
+        {
+            var result = new List<ObservedIdentifierObservation>();
+            using var command = Connection.CreateCommand();
+            command.CommandText = $@"
+SELECT {columnName}, first_seen, last_seen, observation_count
+FROM {tableName}
+WHERE $seenSince IS NULL OR last_seen >= $seenSince
+ORDER BY last_seen DESC, {columnName};";
+            AddObservedSeenSinceParameter(command, seenSince);
+
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                result.Add(new ObservedIdentifierObservation(
+                    reader.GetString(0),
+                    ParseCheckpointTimestamp(reader.GetString(1)),
+                    ParseCheckpointTimestamp(reader.GetString(2)),
+                    reader.GetInt64(3)));
+            }
+
+            return result;
+        }
+
+        private ObservedInventoryKindStatus ReadObservedInventoryKindStatus(
+            string tableName,
+            DateTimeOffset? seenSince)
+        {
+            using var command = Connection.CreateCommand();
+            command.CommandText = $@"
+SELECT
+    COUNT(*),
+    COALESCE(SUM(CASE
+        WHEN $seenSince IS NULL OR last_seen >= $seenSince THEN 1
+        ELSE 0
+    END), 0),
+    MIN(first_seen),
+    MAX(last_seen)
+FROM {tableName};";
+            AddObservedSeenSinceParameter(command, seenSince);
+
+            using var reader = command.ExecuteReader();
+            if (!reader.Read())
+            {
+                return new ObservedInventoryKindStatus(0, 0, null, null);
+            }
+
+            return new ObservedInventoryKindStatus(
+                reader.GetInt64(0),
+                reader.GetInt64(1),
+                reader.IsDBNull(2) ? null : ParseCheckpointTimestamp(reader.GetString(2)),
+                reader.IsDBNull(3) ? null : ParseCheckpointTimestamp(reader.GetString(3)));
+        }
+
+        private static void AddObservedSeenSinceParameter(
+            SqliteCommand command,
+            DateTimeOffset? seenSince)
+        {
+            command.Parameters.AddWithValue(
+                "$seenSince",
+                seenSince.HasValue
+                    ? seenSince.Value.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture)
+                    : DBNull.Value);
+        }
+
+        private long DeleteObservedRows(
+            SqliteTransaction transaction,
+            string tableName,
+            string cutoff)
+        {
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = $"DELETE FROM {tableName} WHERE last_seen < $cutoff;";
+            command.Parameters.AddWithValue("$cutoff", cutoff);
+            return command.ExecuteNonQuery();
         }
 
         public bool TryGetSyncAnchor(string anchorKey, out string anchor)
@@ -552,6 +1905,137 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
             }
         }
 
+        public IReadOnlyList<DriverSyncIdentifierState> GetDriverSyncIdentifierStates(
+            string scopeKey,
+            IEnumerable<DriverSyncIdentifier> identifiers)
+        {
+            if (string.IsNullOrWhiteSpace(scopeKey))
+            {
+                return Array.Empty<DriverSyncIdentifierState>();
+            }
+
+            var requestedIdentifiers = new HashSet<DriverSyncIdentifier>(
+                (identifiers ?? Array.Empty<DriverSyncIdentifier>())
+                    .Where(identifier => identifier != null));
+            if (requestedIdentifiers.Count == 0)
+            {
+                return Array.Empty<DriverSyncIdentifierState>();
+            }
+
+            StateLock.EnterReadLock();
+            try
+            {
+                var result = new List<DriverSyncIdentifierState>();
+                using var command = Connection.CreateCommand();
+                command.CommandText = @"
+SELECT identifier_type, identifier, anchor, updated_at
+FROM driver_sync_identifier_anchors
+WHERE scope_key = $scopeKey
+ORDER BY identifier_type, identifier;";
+                command.Parameters.AddWithValue("$scopeKey", scopeKey);
+
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    var identifier = new DriverSyncIdentifier(
+                        (DriverSyncIdentifierType)reader.GetInt32(0),
+                        reader.GetString(1));
+                    if (!requestedIdentifiers.Contains(identifier))
+                    {
+                        continue;
+                    }
+
+                    result.Add(new DriverSyncIdentifierState(
+                        scopeKey,
+                        identifier,
+                        reader.GetString(2),
+                        ParseCheckpointTimestamp(reader.GetString(3))));
+                }
+
+                return result;
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        public IReadOnlyList<DriverSyncCheckpointInfo> GetDriverSyncCheckpoints(string scopeKey)
+        {
+            if (string.IsNullOrWhiteSpace(scopeKey))
+            {
+                return Array.Empty<DriverSyncCheckpointInfo>();
+            }
+
+            StateLock.EnterReadLock();
+            try
+            {
+                var checkpointRows = new List<SyncCheckpointInfo>();
+                using (var checkpointCommand = Connection.CreateCommand())
+                {
+                    checkpointCommand.CommandText = @"
+SELECT
+    checkpoint.anchor_key,
+    checkpoint.anchor_from,
+    checkpoint.anchor_to,
+    checkpoint.total_items,
+    checkpoint.completed_items,
+    checkpoint.created_at,
+    checkpoint.updated_at
+FROM driver_sync_checkpoint_scopes AS driver_scope
+JOIN sync_checkpoints AS checkpoint
+  ON checkpoint.anchor_key = driver_scope.anchor_key
+WHERE driver_scope.scope_key = $scopeKey
+ORDER BY checkpoint.created_at, checkpoint.anchor_key;";
+                    checkpointCommand.Parameters.AddWithValue("$scopeKey", scopeKey);
+
+                    using var checkpointReader = checkpointCommand.ExecuteReader();
+                    while (checkpointReader.Read())
+                    {
+                        checkpointRows.Add(new SyncCheckpointInfo(
+                            checkpointReader.GetString(0),
+                            checkpointReader.IsDBNull(1) ? null : checkpointReader.GetString(1),
+                            checkpointReader.GetString(2),
+                            checked((int)checkpointReader.GetInt64(3)),
+                            checked((int)checkpointReader.GetInt64(4)),
+                            ParseCheckpointTimestamp(checkpointReader.GetString(5)),
+                            ParseCheckpointTimestamp(checkpointReader.GetString(6))));
+                    }
+                }
+
+                var checkpoints = new List<DriverSyncCheckpointInfo>(checkpointRows.Count);
+                foreach (var checkpoint in checkpointRows)
+                {
+                    var members = new List<DriverSyncIdentifier>();
+                    using var memberCommand = Connection.CreateCommand();
+                    memberCommand.CommandText = @"
+SELECT identifier_type, identifier
+FROM driver_sync_checkpoint_members
+WHERE anchor_key = $anchorKey
+ORDER BY identifier_type, identifier;";
+                    memberCommand.Parameters.AddWithValue("$anchorKey", checkpoint.AnchorKey);
+                    using var memberReader = memberCommand.ExecuteReader();
+                    while (memberReader.Read())
+                    {
+                        members.Add(new DriverSyncIdentifier(
+                            (DriverSyncIdentifierType)memberReader.GetInt32(0),
+                            memberReader.GetString(1)));
+                    }
+
+                    checkpoints.Add(new DriverSyncCheckpointInfo(
+                        scopeKey,
+                        checkpoint,
+                        members));
+                }
+
+                return checkpoints;
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
         public bool TryGetSyncCheckpoint(string anchorKey, out SyncCheckpointInfo checkpoint)
         {
             checkpoint = null;
@@ -604,6 +2088,112 @@ WHERE anchor_key = $anchorKey;";
             string anchorTo,
             IReadOnlyList<IPackageIdentity> packageIdentities)
         {
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var transaction = Connection.BeginTransaction();
+                InsertSyncCheckpoint(
+                    transaction,
+                    anchorKey,
+                    anchorFrom,
+                    anchorTo,
+                    packageIdentities);
+                transaction.Commit();
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public void CreateDriverSyncCheckpoint(
+            string checkpointAnchorKey,
+            string scopeKey,
+            string anchorFrom,
+            string anchorTo,
+            IReadOnlyList<IPackageIdentity> packageIdentities,
+            IReadOnlyCollection<DriverSyncIdentifier> identifiers)
+        {
+            if (string.IsNullOrWhiteSpace(scopeKey))
+            {
+                throw new ArgumentException("A driver synchronization scope key is required", nameof(scopeKey));
+            }
+
+            var normalizedIdentifiers = (identifiers ?? Array.Empty<DriverSyncIdentifier>())
+                .Where(identifier => identifier != null)
+                .Distinct()
+                .OrderBy(identifier => (int)identifier.Type)
+                .ThenBy(identifier => identifier.Value, StringComparer.Ordinal)
+                .ToList();
+            if (normalizedIdentifiers.Count == 0)
+            {
+                throw new ArgumentException(
+                    "At least one driver synchronization identifier is required.",
+                    nameof(identifiers));
+            }
+
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var transaction = Connection.BeginTransaction();
+                InsertSyncCheckpoint(
+                    transaction,
+                    checkpointAnchorKey,
+                    anchorFrom,
+                    anchorTo,
+                    packageIdentities);
+
+                using (var scopeCommand = Connection.CreateCommand())
+                {
+                    scopeCommand.Transaction = transaction;
+                    scopeCommand.CommandText = @"
+INSERT INTO driver_sync_checkpoint_scopes(anchor_key, scope_key)
+VALUES ($anchorKey, $scopeKey);";
+                    scopeCommand.Parameters.AddWithValue("$anchorKey", checkpointAnchorKey);
+                    scopeCommand.Parameters.AddWithValue("$scopeKey", scopeKey);
+                    scopeCommand.ExecuteNonQuery();
+                }
+
+                using (var memberCommand = Connection.CreateCommand())
+                {
+                    memberCommand.Transaction = transaction;
+                    memberCommand.CommandText = @"
+INSERT INTO driver_sync_checkpoint_members(anchor_key, identifier_type, identifier)
+VALUES ($anchorKey, $identifierType, $identifier);";
+                    var anchorKeyParameter = memberCommand.Parameters.Add("$anchorKey", SqliteType.Text);
+                    var identifierTypeParameter = memberCommand.Parameters.Add("$identifierType", SqliteType.Integer);
+                    var identifierParameter = memberCommand.Parameters.Add("$identifier", SqliteType.Text);
+                    memberCommand.Prepare();
+
+                    anchorKeyParameter.Value = checkpointAnchorKey;
+                    foreach (var identifier in normalizedIdentifiers)
+                    {
+                        identifierTypeParameter.Value = (int)identifier.Type;
+                        identifierParameter.Value = identifier.Value;
+                        memberCommand.ExecuteNonQuery();
+                    }
+                }
+
+                transaction.Commit();
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        private long InsertSyncCheckpoint(
+            SqliteTransaction transaction,
+            string anchorKey,
+            string anchorFrom,
+            string anchorTo,
+            IReadOnlyList<IPackageIdentity> packageIdentities)
+        {
+            if (transaction == null)
+            {
+                throw new ArgumentNullException(nameof(transaction));
+            }
+
             if (string.IsNullOrWhiteSpace(anchorKey))
             {
                 throw new ArgumentException("A checkpoint anchor key is required", nameof(anchorKey));
@@ -618,37 +2208,28 @@ WHERE anchor_key = $anchorKey;";
                 .Where(identity => identity != null)
                 .Distinct()
                 .ToList();
+            var identities = requestedIdentities
+                .Where(identity => !_IdentityToIndexMap.ContainsKey(identity))
+                .ToList();
             var now = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
 
-            StateLock.EnterWriteLock();
-            try
+            using (var existenceCommand = Connection.CreateCommand())
             {
-                // Existing package rows are already durable and do not need a
-                // temporary checkpoint item. This keeps forced full queries on a
-                // populated store from duplicating the whole identity list.
-                var identities = requestedIdentities
-                    .Where(identity => !_IdentityToIndexMap.ContainsKey(identity))
-                    .ToList();
-
-                using var transaction = Connection.BeginTransaction();
-
-                using (var existenceCommand = Connection.CreateCommand())
+                existenceCommand.Transaction = transaction;
+                existenceCommand.CommandText =
+                    "SELECT COUNT(*) FROM sync_checkpoints WHERE anchor_key = $anchorKey;";
+                existenceCommand.Parameters.AddWithValue("$anchorKey", anchorKey);
+                if ((long)existenceCommand.ExecuteScalar() != 0)
                 {
-                    existenceCommand.Transaction = transaction;
-                    existenceCommand.CommandText =
-                        "SELECT COUNT(*) FROM sync_checkpoints WHERE anchor_key = $anchorKey;";
-                    existenceCommand.Parameters.AddWithValue("$anchorKey", anchorKey);
-                    if ((long)existenceCommand.ExecuteScalar() != 0)
-                    {
-                        throw new InvalidOperationException(
-                            $"An unfinished synchronization checkpoint already exists for {anchorKey}");
-                    }
+                    throw new InvalidOperationException(
+                        $"An unfinished synchronization checkpoint already exists for {anchorKey}");
                 }
+            }
 
-                using (var checkpointCommand = Connection.CreateCommand())
-                {
-                    checkpointCommand.Transaction = transaction;
-                    checkpointCommand.CommandText = @"
+            using (var checkpointCommand = Connection.CreateCommand())
+            {
+                checkpointCommand.Transaction = transaction;
+                checkpointCommand.CommandText = @"
 INSERT INTO sync_checkpoints(
     anchor_key,
     anchor_from,
@@ -658,51 +2239,46 @@ INSERT INTO sync_checkpoints(
     created_at,
     updated_at)
 VALUES ($anchorKey, $anchorFrom, $anchorTo, $totalItems, 0, $createdAt, $updatedAt);";
-                    checkpointCommand.Parameters.AddWithValue("$anchorKey", anchorKey);
-                    checkpointCommand.Parameters.AddWithValue("$anchorFrom", (object)anchorFrom ?? DBNull.Value);
-                    checkpointCommand.Parameters.AddWithValue("$anchorTo", anchorTo);
-                    checkpointCommand.Parameters.AddWithValue("$totalItems", identities.Count);
-                    checkpointCommand.Parameters.AddWithValue("$createdAt", now);
-                    checkpointCommand.Parameters.AddWithValue("$updatedAt", now);
-                    checkpointCommand.ExecuteNonQuery();
-                }
+                checkpointCommand.Parameters.AddWithValue("$anchorKey", anchorKey);
+                checkpointCommand.Parameters.AddWithValue("$anchorFrom", (object)anchorFrom ?? DBNull.Value);
+                checkpointCommand.Parameters.AddWithValue("$anchorTo", anchorTo);
+                checkpointCommand.Parameters.AddWithValue("$totalItems", identities.Count);
+                checkpointCommand.Parameters.AddWithValue("$createdAt", now);
+                checkpointCommand.Parameters.AddWithValue("$updatedAt", now);
+                checkpointCommand.ExecuteNonQuery();
+            }
 
-                long checkpointId;
-                using (var idCommand = Connection.CreateCommand())
-                {
-                    idCommand.Transaction = transaction;
-                    idCommand.CommandText =
-                        "SELECT checkpoint_id FROM sync_checkpoints WHERE anchor_key = $anchorKey;";
-                    idCommand.Parameters.AddWithValue("$anchorKey", anchorKey);
-                    checkpointId = (long)idCommand.ExecuteScalar();
-                }
+            long checkpointId;
+            using (var idCommand = Connection.CreateCommand())
+            {
+                idCommand.Transaction = transaction;
+                idCommand.CommandText =
+                    "SELECT checkpoint_id FROM sync_checkpoints WHERE anchor_key = $anchorKey;";
+                idCommand.Parameters.AddWithValue("$anchorKey", anchorKey);
+                checkpointId = (long)idCommand.ExecuteScalar();
+            }
 
-                using (var itemCommand = Connection.CreateCommand())
-                {
-                    itemCommand.Transaction = transaction;
-                    itemCommand.CommandText = @"
+            using (var itemCommand = Connection.CreateCommand())
+            {
+                itemCommand.Transaction = transaction;
+                itemCommand.CommandText = @"
 INSERT INTO sync_checkpoint_items(checkpoint_id, ordinal, identity)
 VALUES ($checkpointId, $ordinal, $identity);";
-                    var checkpointIdParameter = itemCommand.Parameters.Add("$checkpointId", SqliteType.Integer);
-                    var ordinalParameter = itemCommand.Parameters.Add("$ordinal", SqliteType.Integer);
-                    var identityParameter = itemCommand.Parameters.Add("$identity", SqliteType.Text);
-                    itemCommand.Prepare();
+                var checkpointIdParameter = itemCommand.Parameters.Add("$checkpointId", SqliteType.Integer);
+                var ordinalParameter = itemCommand.Parameters.Add("$ordinal", SqliteType.Integer);
+                var identityParameter = itemCommand.Parameters.Add("$identity", SqliteType.Text);
+                itemCommand.Prepare();
 
-                    checkpointIdParameter.Value = checkpointId;
-                    for (var index = 0; index < identities.Count; index++)
-                    {
-                        ordinalParameter.Value = index;
-                        identityParameter.Value = identities[index].ToString();
-                        itemCommand.ExecuteNonQuery();
-                    }
+                checkpointIdParameter.Value = checkpointId;
+                for (var index = 0; index < identities.Count; index++)
+                {
+                    ordinalParameter.Value = index;
+                    identityParameter.Value = identities[index].ToString();
+                    itemCommand.ExecuteNonQuery();
                 }
+            }
 
-                transaction.Commit();
-            }
-            finally
-            {
-                StateLock.ExitWriteLock();
-            }
+            return checkpointId;
         }
 
         public IReadOnlyList<IPackageIdentity> GetPendingSyncCheckpointItems(string anchorKey, int maxCount)
@@ -1034,6 +2610,153 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
             {
                 StateLock.ExitWriteLock();
             }
+        }
+
+        public void CompleteDriverSyncCheckpoint(string checkpointAnchorKey)
+        {
+            if (string.IsNullOrWhiteSpace(checkpointAnchorKey))
+            {
+                throw new ArgumentException(
+                    "A driver checkpoint anchor key is required",
+                    nameof(checkpointAnchorKey));
+            }
+
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var transaction = Connection.BeginTransaction();
+                string scopeKey;
+                string anchorTo;
+
+                using (var checkpointCommand = Connection.CreateCommand())
+                {
+                    checkpointCommand.Transaction = transaction;
+                    checkpointCommand.CommandText = @"
+SELECT
+    driver_scope.scope_key,
+    checkpoint.anchor_to,
+    checkpoint.total_items,
+    checkpoint.completed_items
+FROM driver_sync_checkpoint_scopes AS driver_scope
+JOIN sync_checkpoints AS checkpoint
+  ON checkpoint.anchor_key = driver_scope.anchor_key
+WHERE checkpoint.anchor_key = $anchorKey;";
+                    checkpointCommand.Parameters.AddWithValue("$anchorKey", checkpointAnchorKey);
+                    using var reader = checkpointCommand.ExecuteReader();
+                    if (!reader.Read())
+                    {
+                        throw new InvalidOperationException(
+                            $"No driver synchronization checkpoint exists for {checkpointAnchorKey}");
+                    }
+
+                    scopeKey = reader.GetString(0);
+                    anchorTo = reader.GetString(1);
+                    var totalItems = reader.GetInt64(2);
+                    var completedItems = reader.GetInt64(3);
+                    if (completedItems != totalItems)
+                    {
+                        throw new InvalidOperationException(
+                            $"Cannot promote driver anchors while " +
+                            $"{totalItems - completedItems} checkpoint item(s) are pending");
+                    }
+                }
+
+                using (var pendingCommand = Connection.CreateCommand())
+                {
+                    pendingCommand.Transaction = transaction;
+                    pendingCommand.CommandText = @"
+SELECT COUNT(*)
+FROM sync_checkpoint_items AS item
+JOIN sync_checkpoints AS checkpoint
+  ON checkpoint.checkpoint_id = item.checkpoint_id
+WHERE checkpoint.anchor_key = $anchorKey
+  AND item.completed = 0;";
+                    pendingCommand.Parameters.AddWithValue("$anchorKey", checkpointAnchorKey);
+                    var pendingCount = (long)pendingCommand.ExecuteScalar();
+                    if (pendingCount != 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"Cannot promote driver anchors while {pendingCount} checkpoint item(s) are pending");
+                    }
+                }
+
+                var members = new List<(int Type, string Value)>();
+                using (var memberCommand = Connection.CreateCommand())
+                {
+                    memberCommand.Transaction = transaction;
+                    memberCommand.CommandText = @"
+SELECT identifier_type, identifier
+FROM driver_sync_checkpoint_members
+WHERE anchor_key = $anchorKey
+ORDER BY identifier_type, identifier;";
+                    memberCommand.Parameters.AddWithValue("$anchorKey", checkpointAnchorKey);
+                    using var reader = memberCommand.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        members.Add((reader.GetInt32(0), reader.GetString(1)));
+                    }
+                }
+
+                if (members.Count == 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Driver checkpoint {checkpointAnchorKey} has no identifier members");
+                }
+
+                var now = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
+                using (var stateCommand = Connection.CreateCommand())
+                {
+                    stateCommand.Transaction = transaction;
+                    stateCommand.CommandText = @"
+INSERT INTO driver_sync_identifier_anchors(
+    scope_key,
+    identifier_type,
+    identifier,
+    anchor,
+    updated_at)
+VALUES ($scopeKey, $identifierType, $identifier, $anchor, $updatedAt)
+ON CONFLICT(scope_key, identifier_type, identifier) DO UPDATE SET
+    anchor = excluded.anchor,
+    updated_at = excluded.updated_at;";
+                    var scopeKeyParameter = stateCommand.Parameters.Add("$scopeKey", SqliteType.Text);
+                    var identifierTypeParameter = stateCommand.Parameters.Add("$identifierType", SqliteType.Integer);
+                    var identifierParameter = stateCommand.Parameters.Add("$identifier", SqliteType.Text);
+                    var anchorParameter = stateCommand.Parameters.Add("$anchor", SqliteType.Text);
+                    var updatedAtParameter = stateCommand.Parameters.Add("$updatedAt", SqliteType.Text);
+                    stateCommand.Prepare();
+
+                    scopeKeyParameter.Value = scopeKey;
+                    anchorParameter.Value = anchorTo;
+                    updatedAtParameter.Value = now;
+                    foreach (var member in members)
+                    {
+                        identifierTypeParameter.Value = member.Type;
+                        identifierParameter.Value = member.Value;
+                        stateCommand.ExecuteNonQuery();
+                    }
+                }
+
+                using (var deleteCommand = Connection.CreateCommand())
+                {
+                    deleteCommand.Transaction = transaction;
+                    deleteCommand.CommandText =
+                        "DELETE FROM sync_checkpoints WHERE anchor_key = $anchorKey;";
+                    deleteCommand.Parameters.AddWithValue("$anchorKey", checkpointAnchorKey);
+                    deleteCommand.ExecuteNonQuery();
+                }
+
+                transaction.Commit();
+                TryReclaimCheckpointStorage();
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public void ClearDriverSyncCheckpoint(string checkpointAnchorKey)
+        {
+            ClearSyncCheckpoint(checkpointAnchorKey);
         }
 
         public void ClearSyncCheckpoint(string anchorKey)
@@ -1551,6 +3274,7 @@ WHERE sha1_base64 = $sha1;";
                     // Do not store the full per-package file list here. File metadata is deduplicated
                     // by SHA1 in file_locations and associated to packages through package_file_map.
                     InsertPackage(package, packageIndex, packageType, metadataStorage.Bytes, metadataStorage.Compression, null, transaction);
+                    InsertClientSyncMetadata(package, packageIndex, transaction);
                     InsertFileLocations(package, packageIndex, transaction);
 
                     stagedPackages.Add(new StagedPackage
@@ -1567,6 +3291,20 @@ WHERE sha1_base64 = $sha1;";
                     {
                         PackagesAddProgress?.Invoke(this, progressArgs);
                     }
+                }
+
+                if (stagedPackages.Count > 0 && IsCatalogGenerationPublicationDeferred)
+                {
+                    using var unpublishedCommand = Connection.CreateCommand();
+                    unpublishedCommand.Transaction = transaction;
+                    unpublishedCommand.CommandText = @"
+INSERT INTO store_properties(key, value)
+VALUES ($key, '1')
+ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
+                    unpublishedCommand.Parameters.AddWithValue(
+                        "$key",
+                        CatalogUnpublishedChangesKey);
+                    unpublishedCommand.ExecuteNonQuery();
                 }
 
                 transaction.Commit();
@@ -1586,6 +3324,7 @@ WHERE sha1_base64 = $sha1;";
                 {
                     IsDirty = true;
                     IsIndexDirty = true;
+                    CatalogGenerationDirty = true;
                 }
 
                 PackagesAddProgress?.Invoke(this, progressArgs);
@@ -1708,18 +3447,195 @@ WHERE sha1_base64 = $sha1;";
             using var command = Connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText = @"
-INSERT INTO packages(package_index, partition, open_id_hex, identity, package_type, metadata, metadata_compression, files_json, files_blob, files_compression)
-VALUES ($packageIndex, $partition, $openIdHex, $identity, $packageType, $metadata, $metadataCompression, NULL, $filesBlob, $filesCompression);";
+INSERT INTO packages(package_index, partition, open_id_hex, identity, package_type, published, metadata, metadata_compression, files_json, files_blob, files_compression)
+VALUES ($packageIndex, $partition, $openIdHex, $identity, $packageType, $published, $metadata, $metadataCompression, NULL, $filesBlob, $filesCompression);";
             command.Parameters.AddWithValue("$packageIndex", packageIndex);
             command.Parameters.AddWithValue("$partition", package.Id.Partition);
             command.Parameters.AddWithValue("$openIdHex", package.Id.OpenIdHex);
             command.Parameters.AddWithValue("$identity", package.Id.ToString());
             command.Parameters.AddWithValue("$packageType", packageType);
+            command.Parameters.AddWithValue("$published", IsCatalogGenerationPublicationDeferred ? 0 : 1);
             command.Parameters.AddWithValue("$metadata", metadataBytes);
             command.Parameters.AddWithValue("$metadataCompression", metadataCompression);
             command.Parameters.AddWithValue("$filesBlob", (object)filesBlob ?? DBNull.Value);
             command.Parameters.AddWithValue("$filesCompression", filesBlob == null ? DBNull.Value : (object)CompressionBrotli);
             command.ExecuteNonQuery();
+        }
+
+        private void InsertClientSyncMetadata(IPackage package, int packageIndex, SqliteTransaction transaction)
+        {
+            if (package is not MicrosoftUpdatePackage microsoftUpdatePackage)
+            {
+                return;
+            }
+
+            using (var packageCommand = Connection.CreateCommand())
+            {
+                packageCommand.Transaction = transaction;
+                packageCommand.CommandText = @"
+INSERT INTO client_sync_packages(package_index, update_id, revision_number)
+VALUES ($packageIndex, $updateId, $revisionNumber);";
+                packageCommand.Parameters.AddWithValue("$packageIndex", packageIndex);
+                packageCommand.Parameters.AddWithValue("$updateId", microsoftUpdatePackage.Id.ID.ToString("D"));
+                packageCommand.Parameters.AddWithValue("$revisionNumber", microsoftUpdatePackage.Id.Revision);
+                packageCommand.ExecuteNonQuery();
+            }
+
+            InsertClientSyncPrerequisites(microsoftUpdatePackage, packageIndex, transaction);
+
+            if (microsoftUpdatePackage is SoftwareUpdate softwareUpdate)
+            {
+                InsertClientSyncSupersedence(softwareUpdate, packageIndex, transaction);
+                InsertClientSyncBundles(softwareUpdate, packageIndex, transaction);
+            }
+
+            if (microsoftUpdatePackage is DriverUpdate driverUpdate)
+            {
+                InsertClientSyncDriverHardwareIds(driverUpdate, packageIndex, transaction);
+            }
+        }
+
+        private void InsertClientSyncPrerequisites(
+            MicrosoftUpdatePackage package,
+            int packageIndex,
+            SqliteTransaction transaction)
+        {
+            var prerequisites = package.Prerequisites;
+            if (prerequisites == null || prerequisites.Count == 0)
+            {
+                return;
+            }
+
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+INSERT OR IGNORE INTO client_sync_prerequisites(
+    package_index,
+    prerequisite_update_id,
+    is_category)
+VALUES ($packageIndex, $updateId, $isCategory);";
+            command.Parameters.AddWithValue("$packageIndex", packageIndex);
+            var updateIdParameter = command.Parameters.Add("$updateId", SqliteType.Text);
+            var isCategoryParameter = command.Parameters.Add("$isCategory", SqliteType.Integer);
+            command.Prepare();
+
+            foreach (var prerequisite in prerequisites)
+            {
+                if (prerequisite is Simple simple)
+                {
+                    updateIdParameter.Value = simple.UpdateId.ToString("D");
+                    isCategoryParameter.Value = 0;
+                    command.ExecuteNonQuery();
+                }
+                else if (prerequisite is AtLeastOne atLeastOne)
+                {
+                    foreach (var item in atLeastOne.Simple ?? Enumerable.Empty<Simple>())
+                    {
+                        updateIdParameter.Value = item.UpdateId.ToString("D");
+                        isCategoryParameter.Value = atLeastOne.IsCategory ? 1 : 0;
+                        command.ExecuteNonQuery();
+                    }
+                }
+            }
+        }
+
+        private void InsertClientSyncSupersedence(
+            SoftwareUpdate package,
+            int packageIndex,
+            SqliteTransaction transaction)
+        {
+            var supersededUpdates = package.SupersededUpdates;
+            if (supersededUpdates == null || supersededUpdates.Count == 0)
+            {
+                return;
+            }
+
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+INSERT OR IGNORE INTO client_sync_supersedence(
+    superseding_package_index,
+    superseded_update_id)
+VALUES ($packageIndex, $updateId);";
+            command.Parameters.AddWithValue("$packageIndex", packageIndex);
+            var updateIdParameter = command.Parameters.Add("$updateId", SqliteType.Text);
+            command.Prepare();
+
+            foreach (var updateId in supersededUpdates.Where(value => value != Guid.Empty))
+            {
+                updateIdParameter.Value = updateId.ToString("D");
+                command.ExecuteNonQuery();
+            }
+        }
+
+        private void InsertClientSyncBundles(
+            SoftwareUpdate package,
+            int packageIndex,
+            SqliteTransaction transaction)
+        {
+            var bundledUpdates = package.BundledUpdates;
+            if (bundledUpdates == null || bundledUpdates.Count == 0)
+            {
+                return;
+            }
+
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+INSERT OR IGNORE INTO client_sync_bundles(
+    bundle_package_index,
+    bundled_update_id,
+    bundled_revision_number)
+VALUES ($packageIndex, $updateId, $revisionNumber);";
+            command.Parameters.AddWithValue("$packageIndex", packageIndex);
+            var updateIdParameter = command.Parameters.Add("$updateId", SqliteType.Text);
+            var revisionParameter = command.Parameters.Add("$revisionNumber", SqliteType.Integer);
+            command.Prepare();
+
+            foreach (var identity in bundledUpdates.Where(value => value != null))
+            {
+                updateIdParameter.Value = identity.ID.ToString("D");
+                revisionParameter.Value = identity.Revision;
+                command.ExecuteNonQuery();
+            }
+        }
+
+        private void InsertClientSyncDriverHardwareIds(
+            DriverUpdate package,
+            int packageIndex,
+            SqliteTransaction transaction)
+        {
+            var metadata = package.GetDriverMetadata();
+            if (metadata == null || metadata.Count == 0)
+            {
+                return;
+            }
+
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+INSERT OR IGNORE INTO client_sync_driver_hardware_ids(
+    package_index,
+    metadata_ordinal,
+    hardware_id)
+VALUES ($packageIndex, $metadataOrdinal, $hardwareId);";
+            command.Parameters.AddWithValue("$packageIndex", packageIndex);
+            var ordinalParameter = command.Parameters.Add("$metadataOrdinal", SqliteType.Integer);
+            var hardwareIdParameter = command.Parameters.Add("$hardwareId", SqliteType.Text);
+            command.Prepare();
+
+            for (var index = 0; index < metadata.Count; index++)
+            {
+                var hardwareId = metadata[index]?.HardwareID;
+                if (string.IsNullOrWhiteSpace(hardwareId))
+                {
+                    continue;
+                }
+
+                ordinalParameter.Value = index;
+                hardwareIdParameter.Value = hardwareId.Trim().ToLowerInvariant();
+                command.ExecuteNonQuery();
+            }
         }
 
         private void InsertFileLocations(IPackage package, int packageIndex, SqliteTransaction transaction)
@@ -2146,6 +4062,199 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
             log?.Invoke($"Compacted database installed. Previous database kept as: {backupPath}");
         }
 
+        public MetadataStoreGenerationInfo GetLoadedMetadataGeneration()
+        {
+            StateLock.EnterReadLock();
+            try
+            {
+                return LoadedMetadataGeneration
+                    ?? new MetadataStoreGenerationInfo(0, DateTimeOffset.MinValue);
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        public MetadataStoreGenerationInfo GetPersistentMetadataGeneration()
+        {
+            StateLock.EnterReadLock();
+            try
+            {
+                return ReadMetadataGenerationInfo();
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        public void DeferCatalogPublication()
+        {
+            StateLock.EnterWriteLock();
+            try
+            {
+                IsCatalogGenerationPublicationDeferred = true;
+                WriteProperty(CatalogPublicationDeferredKey, "1");
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public MetadataStoreGenerationInfo PublishDeferredCatalogChanges()
+        {
+            StateLock.EnterWriteLock();
+            try
+            {
+                if (IsDirty || IsIndexDirty)
+                {
+                    WriteIndexes();
+                    IsDirty = false;
+                    IsIndexDirty = false;
+                    PendingPackages.Clear();
+                }
+
+                if (CatalogGenerationDirty)
+                {
+                    LoadedMetadataGeneration = PublishCatalogGeneration();
+                    CatalogGenerationDirty = false;
+                }
+                else
+                {
+                    ClearCatalogPublicationState();
+                }
+
+                return LoadedMetadataGeneration
+                    ?? new MetadataStoreGenerationInfo(0, DateTimeOffset.MinValue);
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
+        public bool ReloadMetadataIfChanged()
+        {
+            StateLock.EnterWriteLock();
+            try
+            {
+                var persistentGeneration = ReadMetadataGenerationInfo();
+                var loadedGeneration = LoadedMetadataGeneration
+                    ?? new MetadataStoreGenerationInfo(0, DateTimeOffset.MinValue);
+                if (persistentGeneration.Generation <= loadedGeneration.Generation)
+                {
+                    return false;
+                }
+
+                // Build the complete replacement state first. The currently loaded
+                // maps and index container remain usable if any read/validation step
+                // fails, so the update server can continue serving its old generation.
+                var replacementIdentityToIndex = new Dictionary<IPackageIdentity, int>();
+                var replacementIndexToIdentity = new Dictionary<int, IPackageIdentity>();
+                var replacementPackageTypes = new Dictionary<int, int>();
+
+                using (var packageCommand = Connection.CreateCommand())
+                {
+                    packageCommand.CommandText = @"
+SELECT package_index, identity, package_type
+FROM packages
+ORDER BY package_index;";
+                    using var reader = packageCommand.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        var packageIndex = reader.GetInt32(0);
+                        var identity = IdentityFromString(reader.GetString(1));
+                        var packageType = reader.GetInt32(2);
+                        replacementIdentityToIndex.Add(identity, packageIndex);
+                        replacementIndexToIdentity.Add(packageIndex, identity);
+                        replacementPackageTypes.Add(packageIndex, packageType);
+                    }
+                }
+
+                MemoryStream replacementIndexStream = null;
+                ZipStreamIndexContainer replacementIndexes = null;
+                try
+                {
+                    var indexData = ReadBlob(IndexBlobKey);
+                    if (indexData != null && indexData.Length > 0)
+                    {
+                        replacementIndexStream = new MemoryStream(indexData, false);
+                        replacementIndexes = ZipStreamIndexContainer.Open(replacementIndexStream);
+                        if (replacementIndexes.GetStatus() != ZipStreamIndexContainer.IndexContainerStatus.Valid)
+                        {
+                            throw new InvalidDataException(
+                                "The newly published metadata index is invalid.");
+                        }
+                    }
+                    else
+                    {
+                        replacementIndexes = ZipStreamIndexContainer.Create();
+                        if (replacementIdentityToIndex.Count > 0)
+                        {
+                            throw new InvalidDataException(
+                                "The newly published catalog contains packages but no metadata index.");
+                        }
+                    }
+
+                    var indexedPackageCountValue = ReadProperty("indexed_package_count");
+                    if (!int.TryParse(
+                            indexedPackageCountValue,
+                            NumberStyles.Integer,
+                            CultureInfo.InvariantCulture,
+                            out var indexedPackageCount)
+                        || indexedPackageCount != replacementIdentityToIndex.Count)
+                    {
+                        throw new InvalidDataException(
+                            $"The newly published metadata index covers {indexedPackageCountValue ?? "an unknown number of"} " +
+                            $"package(s), while SQLite contains {replacementIdentityToIndex.Count}.");
+                    }
+
+                    var previousIndexes = Indexes;
+                    var previousIndexStream = IndexBackingStream;
+
+                    _IdentityToIndexMap = replacementIdentityToIndex;
+                    _IndexToIdentityMap = replacementIndexToIdentity;
+                    _PackageTypeIndex = replacementPackageTypes;
+                    _NextPackageIndex = replacementIndexToIdentity.Count == 0
+                        ? 0
+                        : replacementIndexToIdentity.Keys.Max() + 1;
+                    Indexes = replacementIndexes;
+                    IndexBackingStream = replacementIndexStream;
+                    replacementIndexes = null;
+                    replacementIndexStream = null;
+                    PendingPackages.Clear();
+                    IsDirty = false;
+                    IsIndexDirty = false;
+                    CatalogGenerationDirty = false;
+                    _IsReindexingRequired = false;
+                    LoadedMetadataGeneration = persistentGeneration;
+
+                    try
+                    {
+                        previousIndexes?.CloseInput();
+                        previousIndexStream?.Dispose();
+                    }
+                    catch
+                    {
+                        // The replacement state is already active. Disposal of
+                        // the old read-only index stream is best-effort.
+                    }
+                    return true;
+                }
+                finally
+                {
+                    replacementIndexes?.CloseInput();
+                    replacementIndexStream?.Dispose();
+                }
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+        }
+
         public void Flush()
         {
             StateLock.EnterWriteLock();
@@ -2157,6 +4266,16 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
                     IsDirty = false;
                     IsIndexDirty = false;
                     PendingPackages.Clear();
+                }
+
+                if (CatalogGenerationDirty && !IsCatalogGenerationPublicationDeferred)
+                {
+                    LoadedMetadataGeneration = PublishCatalogGeneration();
+                    CatalogGenerationDirty = false;
+                }
+                else if (CatalogGenerationDirty)
+                {
+                    PersistUnpublishedCatalogChanges();
                 }
             }
             finally
@@ -2198,6 +4317,7 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
                 PackageIndexingProgress?.Invoke(this, progressEvent);
                 _IsReindexingRequired = false;
                 IsIndexDirty = true;
+                CatalogGenerationDirty = true;
             }
             finally
             {

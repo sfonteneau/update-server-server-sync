@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
 using Microsoft.Extensions.Configuration;
@@ -25,7 +25,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
     /// </summary>
     public class UpdateServerStartup
     {
-        readonly IMetadataStore MetadataSource;
+        readonly IClientSyncMetadataStore MetadataSource;
 
         readonly Config UpdateServiceConfiguration;
 
@@ -33,23 +33,27 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
 
         readonly string ContentRoot;
 
+
         /// <summary>
         /// Creates the update server startup using the specified configuration an update metadata store
         /// </summary>
         /// <param name="config">Startup configuration
         /// <para>ASP.NET configuration.</para>
-        /// 
+        ///
         /// <para>Must contain a string entry "metadata-path" with the path to the metadata source to use</para>
-        /// 
+        ///
         /// <para>Must contain a string entry "service-config-json" with the service configuration JSON</para>
-        /// 
+        ///
         /// <para>Can contain a string entry "content-path" with the path to the content store to use if serving update content</para>
         /// </param>
         /// <exception cref="System.Exception">If the content store specified in the configuration cannot be opened</exception>
         public UpdateServerStartup(IConfiguration config)
         {
             var metadataPath = config.GetValue<string>("metadata-path");
-            MetadataSource = PackageStore.Open(metadataPath);
+            // The client-facing service uses a direct SQLite read model. Unpublished
+            // rows from an interrupted fetch are filtered in SQL, so the server can
+            // safely keep serving the previous published catalog after a restart.
+            MetadataSource = PackageStore.OpenClientSync(metadataPath);
 
             UpdateServiceConfiguration = JsonConvert.DeserializeObject<Config>(config.GetValue<string>("service-config-json"));
 
@@ -84,6 +88,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
             clientSyncService.SetServiceConfiguration(UpdateServiceConfiguration);
             clientSyncService.SetPackageStore(MetadataSource);
 
+            services.AddSingleton<IClientSyncMetadataStore>(MetadataSource);
             services.TryAddSingleton<ClientSyncWebService>(clientSyncService);
             services.TryAddSingleton<SimpleAuthenticationWebService>();
             services.TryAddSingleton<ReportingWebService>();
@@ -124,7 +129,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
 
             // Wire the upstream WCF services
             app.UseSoapEndpoint<ClientSyncWebService>(
-                "/ClientWebService/client.asmx", 
+                "/ClientWebService/client.asmx",
                 new SoapEncoderOptions() { WriteEncoding = new UTF8Encoding(false) },
                 SoapSerializer.XmlSerializer);
 

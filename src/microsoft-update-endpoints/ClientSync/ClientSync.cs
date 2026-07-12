@@ -1,64 +1,39 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-using System;
-using System.Collections.Generic;
-using System.Threading.Tasks;
-using System.Linq;
-using Microsoft.UpdateServices.WebServices.ClientSync;
-using System.IO;
-using System.Threading;
-using System.ServiceModel;
-using Microsoft.PackageGraph.Storage;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
-using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Drivers;
-using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Prerequisites;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Content;
 using Microsoft.PackageGraph.ObjectModel;
+using Microsoft.PackageGraph.Storage;
+using Microsoft.UpdateServices.WebServices.ClientSync;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.ServiceModel;
 using System.Text;
+using System.Threading.Tasks;
 
 namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
 {
     /// <summary>
-    /// Update server implementation. Provides updates to Windows Update clients.
-    /// <para>The communication protocol with clients is SOAP.</para>
+    /// Update server implementation. The client-facing service reads the published
+    /// catalog directly from SQLite for every request and does not retain a package
+    /// catalog, prerequisite graph, driver index or metadata object cache in memory.
     /// </summary>
     public partial class ClientSyncWebService : IClientSyncWebService
     {
         /// <summary>
-        /// The local repository from where updates are served.
+        /// Direct SQLite read model used for all client requests.
         /// </summary>
-        public IMetadataStore MetadataSource { get; private set; }
+        public IClientSyncMetadataStore MetadataSource { get; private set; }
 
-        readonly ReaderWriterLockSlim MetadataSourceLock = new();
-
-        /// <summary>
-        /// Mapping of update index to its identity
-        /// Update indexes are used when communicating with clients, as they are smaller that full Identities
-        /// </summary>
-        Dictionary<int, MicrosoftUpdatePackageIdentity> MetadataSourceIndex;
-
-        Config ServiceConfiguration;
-
-        private IEnumerable<Guid> RootUpdates;
-
-        private IEnumerable<Guid> NonLeafUpdates;
-
-        private IEnumerable<Guid> LeafUpdatesGuids;
-
-        private List<Guid> SoftwareLeafUpdateGuids;
-
-        private Dictionary<Guid, int> IdToRevisionMap;
-        private Dictionary<Guid, MicrosoftUpdatePackageIdentity> IdToFullIdentityMap;
-
+        private Config ServiceConfiguration;
         private const int MaxUpdatesInResponse = 50;
-
         private string ContentRoot;
 
-        DriverUpdateMatching DriverMatcher;
-
         /// <summary>
-        /// Default constructor
+        /// Default constructor.
         /// </summary>
         public ClientSyncWebService()
         {
@@ -67,10 +42,9 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         }
 
         /// <summary>
-        /// Sets the host name for the server that serves the update content.
-        /// Microsoft Update URLs are still preferred when they are available in metadata.
+        /// Sets the host name for the server that serves update content. Microsoft
+        /// Update URLs remain preferred when they are present in the metadata.
         /// </summary>
-        /// <param name="hostName"></param>
         public void SetContentURLBase(string hostName)
         {
             ContentRoot = hostName;
@@ -79,17 +53,17 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         private string GetPreferredDownloadUrl(UpdateFile file, IContentFileDigest digest)
         {
             var urlsForDigest = file.Urls?
-                .Where(u => string.Equals(u.DigestBase64, digest.DigestBase64, StringComparison.Ordinal))
+                .Where(url => string.Equals(
+                    url.DigestBase64,
+                    digest.DigestBase64,
+                    StringComparison.Ordinal))
                 .ToList();
 
-            // Preferred mode for this fork: always give Windows the original Microsoft Update/CDN URL
-            // when the upstream metadata contains one. This keeps this server as a metadata/approval
-            // server only; the update payload is downloaded directly from Microsoft by the client.
             var microsoftUrl = urlsForDigest?
-                .FirstOrDefault(u => !string.IsNullOrEmpty(u.MuUrl))?
+                .FirstOrDefault(url => !string.IsNullOrEmpty(url.MuUrl))?
                 .MuUrl
                 ?? file.Urls?
-                    .FirstOrDefault(u => !string.IsNullOrEmpty(u.MuUrl))?
+                    .FirstOrDefault(url => !string.IsNullOrEmpty(url.MuUrl))?
                     .MuUrl;
 
             if (!string.IsNullOrEmpty(microsoftUrl))
@@ -97,30 +71,37 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                 return microsoftUrl;
             }
 
-            // Fallbacks kept for metadata imported from another WSUS or for local-content deployments.
             if (!string.IsNullOrEmpty(ContentRoot))
             {
                 return $"{ContentRoot}/{digest.HexString.ToLowerInvariant()}";
             }
 
             return urlsForDigest?
-                .FirstOrDefault(u => !string.IsNullOrEmpty(u.UssUrl))?
+                .FirstOrDefault(url => !string.IsNullOrEmpty(url.UssUrl))?
                 .UssUrl
                 ?? file.Urls?
-                    .FirstOrDefault(u => !string.IsNullOrEmpty(u.UssUrl))?
+                    .FirstOrDefault(url => !string.IsNullOrEmpty(url.UssUrl))?
                     .UssUrl;
         }
 
         private FileLocation GetFileLocation(UpdateFile file, byte[] requestedDigest = null)
         {
-            var requestedDigestBase64 = requestedDigest == null ? null : Convert.ToBase64String(requestedDigest);
+            var requestedDigestBase64 = requestedDigest == null
+                ? null
+                : Convert.ToBase64String(requestedDigest);
 
             var digest = !string.IsNullOrEmpty(requestedDigestBase64)
-                ? file.Digests?.FirstOrDefault(d => string.Equals(d.DigestBase64, requestedDigestBase64, StringComparison.Ordinal))
+                ? file.Digests?.FirstOrDefault(candidate => string.Equals(
+                    candidate.DigestBase64,
+                    requestedDigestBase64,
+                    StringComparison.Ordinal))
                 : file.Digests?
-                    .FirstOrDefault(d => file.Urls?.Any(u =>
-                        string.Equals(u.DigestBase64, d.DigestBase64, StringComparison.Ordinal)
-                        && !string.IsNullOrEmpty(u.MuUrl)) == true)
+                    .FirstOrDefault(candidate => file.Urls?.Any(url =>
+                        string.Equals(
+                            url.DigestBase64,
+                            candidate.DigestBase64,
+                            StringComparison.Ordinal)
+                        && !string.IsNullOrEmpty(url.MuUrl)) == true)
                     ?? file.Digest;
 
             if (digest == null)
@@ -134,7 +115,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                 return null;
             }
 
-            return new FileLocation()
+            return new FileLocation
             {
                 FileDigest = Convert.FromBase64String(digest.DigestBase64),
                 Url = url
@@ -142,505 +123,354 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         }
 
         /// <summary>
-        /// Sets the service configuratoin
+        /// Sets the service configuration.
         /// </summary>
-        /// <param name="serviceConfiguration">Service configuration</param>
         public void SetServiceConfiguration(Config serviceConfiguration)
         {
             ServiceConfiguration = serviceConfiguration;
+            UpdateServiceConfigurationLastChange();
         }
 
         /// <summary>
-        /// Sets the source of update metadata
+        /// Sets the direct SQLite client-sync store.
         /// </summary>
-        /// <param name="metadataSource">The source for updates metadata</param>
-        public void SetPackageStore(IMetadataStore metadataSource)
+        public void SetPackageStore(IClientSyncMetadataStore metadataSource)
         {
-            MetadataSourceLock.EnterWriteLock();
-
-            MetadataSource = metadataSource;
-
-            if (MetadataSource != null)
-            {
-                PrerequisitesGraph prereqGraph = PrerequisitesGraph.FromIndexedPackageSource(MetadataSource);
-
-                // Get leaf updates - updates that have prerequisites and no dependents
-                LeafUpdatesGuids = prereqGraph.GetLeafUpdates();
-
-                // Get non leaft updates: updates that have prerequisites and dependents
-                NonLeafUpdates = prereqGraph.GetNonLeafUpdates();
-
-                // Get root updates: updates that have no prerequisites
-                RootUpdates = prereqGraph.GetRootUpdates();
-
-                // Filter out leaf updates and only retain software ones that are not superseded
-                var leafSoftwareUpdates = MetadataSource.
-                    OfType<SoftwareUpdate>()
-                    .Where(u => u.IsSupersededBy == null || u.IsSupersededBy.Count == 0)
-                    .GroupBy(u => u.Id.ID)
-                    .Select(k => k.Key)
-                    .ToHashSet();
-                SoftwareLeafUpdateGuids = LeafUpdatesGuids.Where(g => leafSoftwareUpdates.Contains(g)).ToList();
-
-                // Get the mapping of update index to identity that is used in the metadata source.
-                MetadataSourceIndex = new Dictionary<int, MicrosoftUpdatePackageIdentity>();
-                foreach(var package in MetadataSource.OfType<MicrosoftUpdatePackage>())
-                {
-                    MetadataSourceIndex.Add(MetadataSource.GetPackageIndex(package.Id), package.Id);
-                }
-
-                var latestRevisionSelector = MetadataSourceIndex
-                    .ToDictionary(k => k.Value, v => v.Key)
-                    .GroupBy(p => p.Key.ID)
-                    .Select(group => group.OrderBy(g => g.Key.Revision).Last());
-
-                // Create a mapping for index to update GUID
-                IdToRevisionMap = latestRevisionSelector.ToDictionary(k => k.Key.ID, v => v.Value);
-
-                // Create a mapping from GUID to full identity
-                IdToFullIdentityMap = latestRevisionSelector.ToDictionary(k => k.Key.ID, v => v.Key);
-
-                DriverMatcher = DriverUpdateMatching.FromPackageSource(MetadataSource);
-            }
-            else
-            {
-                LeafUpdatesGuids = null;
-                NonLeafUpdates = null;
-                RootUpdates = null;
-                SoftwareLeafUpdateGuids = null;
-                MetadataSourceIndex = null;
-                IdToRevisionMap = null;
-                IdToFullIdentityMap = null;
-                DriverMatcher = null;
-            }
-
-            MetadataSourceLock.ExitWriteLock();
+            MetadataSource = metadataSource ?? throw new ArgumentNullException(nameof(metadataSource));
+            UpdateServiceConfigurationLastChange();
         }
 
-        /// <summary>
-        /// Handle get configuration requests from clients
-        /// </summary>
-        /// <param name="clientConfiguration">The client configuration as received from a Windows client</param>
-        /// <returns>The server configuration to be sent to a Windows client</returns>
+        private void UpdateServiceConfigurationLastChange()
+        {
+            if (ServiceConfiguration == null || MetadataSource == null)
+            {
+                return;
+            }
+
+            var generation = MetadataSource.GetPublishedCatalogInfo();
+            if (generation.Generation > 0
+                && generation.LastChanged != DateTimeOffset.MinValue)
+            {
+                ServiceConfiguration.LastChange = generation.LastChanged.UtcDateTime;
+            }
+        }
+
+        private void EnsureMetadataSourceAvailable()
+        {
+            if (MetadataSource == null)
+            {
+                throw new FaultException("Metadata source is not configured.");
+            }
+        }
+
+        /// <inheritdoc />
         public Task<Config> GetConfig2Async(ClientConfiguration clientConfiguration)
         {
+            EnsureMetadataSourceAvailable();
+            UpdateServiceConfigurationLastChange();
             return Task.FromResult(ServiceConfiguration);
         }
 
-        /// <summary>
-        /// Handle get configuration requests from clients
-        /// </summary>
-        /// <param name="protocolVersion">The version of the Windows client connecting to this server</param>
-        /// <returns>The server configuration to be sent to a Windows client</returns>
+        /// <inheritdoc />
         public Task<Config> GetConfigAsync(string protocolVersion)
         {
+            EnsureMetadataSourceAvailable();
+            UpdateServiceConfigurationLastChange();
             return Task.FromResult(ServiceConfiguration);
         }
 
-        /// <summary>
-        /// Handle get cookie requests. All requests are all granted access and a cookie is issued.
-        /// </summary>
-        /// <param name="authCookies">Authorization cookies received from the client</param>
-        /// <param name="oldCookie">Old cookie from client</param>
-        /// <param name="lastChange"></param>
-        /// <param name="currentTime"></param>
-        /// <param name="protocolVersion">Client supported protocol version</param>
-        /// <returns>A new cookie</returns>
-        public Task<Cookie> GetCookieAsync(AuthorizationCookie[] authCookies, Cookie oldCookie, DateTime lastChange, DateTime currentTime, string protocolVersion)
+        /// <inheritdoc />
+        public Task<Cookie> GetCookieAsync(
+            AuthorizationCookie[] authCookies,
+            Cookie oldCookie,
+            DateTime lastChange,
+            DateTime currentTime,
+            string protocolVersion)
         {
-            return Task.FromResult(new Cookie() { Expiration = DateTime.Now.AddDays(5), EncryptedData = new byte[12] });
+            EnsureMetadataSourceAvailable();
+            return Task.FromResult(new Cookie
+            {
+                Expiration = DateTime.Now.AddDays(5),
+                EncryptedData = new byte[12]
+            });
         }
 
-        /// <summary>
-        /// Handle requests for extended update information using global update identities.
-        /// This mirrors GetExtendedUpdateInfoAsync and also returns Microsoft Update/CDN file URLs.
-        /// </summary>
-        /// <param name="cookie">Access cookie</param>
-        /// <param name="updateIDs">Update identities</param>
-        /// <param name="infoTypes">The type of extended information requested</param>
-        /// <param name="locales">The language to use when getting language dependent extended information</param>
-        /// <param name="deviceAttributes">Device attributes; unused</param>
-        /// <returns>Extended update information response.</returns>
-        public Task<ExtendedUpdateInfo2> GetExtendedUpdateInfo2Async(Cookie cookie, UpdateIdentity[] updateIDs, XmlUpdateFragmentType[] infoTypes, string[] locales, string deviceAttributes)
+        /// <inheritdoc />
+        public Task<ExtendedUpdateInfo2> GetExtendedUpdateInfo2Async(
+            Cookie cookie,
+            UpdateIdentity[] updateIDs,
+            XmlUpdateFragmentType[] infoTypes,
+            string[] locales,
+            string deviceAttributes)
         {
-            MetadataSourceLock.EnterReadLock();
+            EnsureMetadataSourceAvailable();
 
-            try
+            var requestedUpdates = new List<ClientSyncPackageRecord>();
+            foreach (var updateID in updateIDs ?? Array.Empty<UpdateIdentity>())
             {
-                if (MetadataSource == null)
+                var identity = new MicrosoftUpdatePackageIdentity(
+                    updateID.UpdateID,
+                    updateID.RevisionNumber);
+                if (!MetadataSource.TryGetPackage(identity, out var package))
                 {
-                    throw new FaultException();
+                    throw new FaultException($"Update identity not found: {identity}");
                 }
 
-                var requestedUpdates = new List<MicrosoftUpdatePackage>();
-                foreach (var updateID in updateIDs ?? Array.Empty<UpdateIdentity>())
-                {
-                    var packageIdentity = new MicrosoftUpdatePackageIdentity(updateID.UpdateID, updateID.RevisionNumber);
-                    requestedUpdates.Add(MetadataSource.GetPackage(packageIdentity) as MicrosoftUpdatePackage);
-                }
+                requestedUpdates.Add(package);
+            }
 
-                var updateDataList = new List<UpdateData>();
+            var requestedInfoTypes = infoTypes ?? Array.Empty<XmlUpdateFragmentType>();
+            var updateDataList = new List<UpdateData>();
 
-                if (infoTypes.Contains(XmlUpdateFragmentType.Extended))
+            if (requestedInfoTypes.Contains(XmlUpdateFragmentType.Extended))
+            {
+                foreach (var requestedUpdate in requestedUpdates)
                 {
-                    foreach (var requestedUpdate in requestedUpdates)
+                    updateDataList.Add(new UpdateData
                     {
-                        updateDataList.Add(new UpdateData()
+                        ID = requestedUpdate.RevisionId,
+                        Xml = GetExtendedFragment(requestedUpdate.Package.Id)
+                    });
+                }
+            }
+
+            if (requestedInfoTypes.Contains(XmlUpdateFragmentType.LocalizedProperties))
+            {
+                foreach (var requestedUpdate in requestedUpdates)
+                {
+                    var localizedXml = GetLocalizedProperties(
+                        requestedUpdate.Package.Id,
+                        locales);
+                    if (!string.IsNullOrEmpty(localizedXml))
+                    {
+                        updateDataList.Add(new UpdateData
                         {
-                            ID = MetadataSource.GetPackageIndex(requestedUpdate.Id),
-                            Xml = GetExtendedFragment(requestedUpdate.Id)
+                            ID = requestedUpdate.RevisionId,
+                            Xml = localizedXml
                         });
                     }
                 }
-
-                if (infoTypes.Contains(XmlUpdateFragmentType.LocalizedProperties))
-                {
-                    foreach (var requestedUpdate in requestedUpdates)
-                    {
-                        var localizedXml = GetLocalizedProperties(requestedUpdate.Id, locales);
-
-                        if (!string.IsNullOrEmpty(localizedXml))
-                        {
-                            updateDataList.Add(new UpdateData()
-                            {
-                                ID = MetadataSource.GetPackageIndex(requestedUpdate.Id),
-                                Xml = localizedXml
-                            });
-                        }
-                    }
-                }
-
-                var files = requestedUpdates
-                    .Where(u => u?.Files != null && u.Files.Any())
-                    .SelectMany(u => u.Files.OfType<UpdateFile>())
-                    .Distinct()
-                    .ToList();
-
-                var fileList = new List<FileLocation>();
-                foreach (var file in files)
-                {
-                    var fileLocation = GetFileLocation(file);
-                    if (fileLocation != null)
-                    {
-                        fileList.Add(fileLocation);
-                    }
-                }
-
-                var response = new ExtendedUpdateInfo2();
-
-                if (updateDataList.Count > 0)
-                {
-                    response.Updates = updateDataList.ToArray();
-                }
-
-                if (fileList.Count > 0)
-                {
-                    response.FileLocations = fileList.ToArray();
-                }
-
-                return Task.FromResult(response);
             }
-            finally
+
+            var files = requestedUpdates
+                .SelectMany(update => MetadataSource.GetFiles(update.Package.Id))
+                .GroupBy(file => file.Digest?.DigestBase64 ?? string.Empty, StringComparer.Ordinal)
+                .Select(group => group.First())
+                .ToList();
+            var fileList = files
+                .Select(file => GetFileLocation(file))
+                .Where(location => location != null)
+                .ToList();
+
+            return Task.FromResult(new ExtendedUpdateInfo2
             {
-                MetadataSourceLock.ExitReadLock();
-            }
+                Updates = updateDataList.Count == 0 ? null : updateDataList.ToArray(),
+                FileLocations = fileList.Count == 0 ? null : fileList.ToArray()
+            });
         }
 
-        string GetCoreFragment(MicrosoftUpdatePackageIdentity updateIdentity)
+        private string GetCoreFragment(MicrosoftUpdatePackageIdentity updateIdentity)
         {
             using var xmlStream = MetadataSource.GetMetadata(updateIdentity);
             using var xmlReader = new StreamReader(xmlStream, Encoding.Unicode);
             return UpdateXmlTransformer.GetCoreFragmentFromMetadataXml(xmlReader.ReadToEnd());
         }
 
-        string GetExtendedFragment(MicrosoftUpdatePackageIdentity updateIdentity)
+        private string GetExtendedFragment(MicrosoftUpdatePackageIdentity updateIdentity)
         {
             using var xmlStream = MetadataSource.GetMetadata(updateIdentity);
             using var xmlReader = new StreamReader(xmlStream, Encoding.Unicode);
             return UpdateXmlTransformer.GetExtendedFragmentFromMetadataXml(xmlReader.ReadToEnd());
         }
 
-        string GetLocalizedProperties(MicrosoftUpdatePackageIdentity updateIdentity, string[] languages)
+        private string GetLocalizedProperties(
+            MicrosoftUpdatePackageIdentity updateIdentity,
+            string[] languages)
         {
             using var xmlStream = MetadataSource.GetMetadata(updateIdentity);
             using var xmlReader = new StreamReader(xmlStream, Encoding.Unicode);
-            return UpdateXmlTransformer.GetLocalizedPropertiesFromMetadataXml(xmlReader.ReadToEnd(), languages);
+            return UpdateXmlTransformer.GetLocalizedPropertiesFromMetadataXml(
+                xmlReader.ReadToEnd(),
+                languages);
         }
 
-        /// <summary>
-        /// Handle requests for extended update information. The extended information is extracted from update metadata.
-        /// Extended information also includes file URLs
-        /// </summary>
-        /// <param name="cookie">Access cookie</param>
-        /// <param name="revisionIDs">Revision Ids for which to get extended information</param>
-        /// <param name="infoTypes">The type of extended information requested</param>
-        /// <param name="locales">The language to use when getting language dependent extended information</param>
-        /// <param name="deviceAttributes">Device attributes; unused</param>
-        /// <returns>Extended update information response.</returns>
-        public Task<ExtendedUpdateInfo> GetExtendedUpdateInfoAsync(Cookie cookie, int[] revisionIDs, XmlUpdateFragmentType[] infoTypes, string[] locales, string deviceAttributes)
+        /// <inheritdoc />
+        public Task<ExtendedUpdateInfo> GetExtendedUpdateInfoAsync(
+            Cookie cookie,
+            int[] revisionIDs,
+            XmlUpdateFragmentType[] infoTypes,
+            string[] locales,
+            string deviceAttributes)
         {
-            MetadataSourceLock.EnterReadLock();
+            EnsureMetadataSourceAvailable();
 
-            if (MetadataSource == null)
+            var requestedUpdates = new List<ClientSyncPackageRecord>();
+            foreach (var requestedRevision in revisionIDs ?? Array.Empty<int>())
             {
-                throw new FaultException();
-            }
-
-            List<MicrosoftUpdatePackage> requestedUpdates = new();
-            foreach (var requestedRevision in revisionIDs)
-            {
-                if (!MetadataSourceIndex.TryGetValue(requestedRevision, out MicrosoftUpdatePackageIdentity id))
+                if (!MetadataSource.TryGetPackage(requestedRevision, out var package))
                 {
-                    throw new Exception("RevisionID not found");
+                    throw new FaultException($"Revision ID not found: {requestedRevision}");
                 }
 
-                requestedUpdates.Add(MetadataSource.GetPackage(id) as MicrosoftUpdatePackage);
+                requestedUpdates.Add(package);
             }
 
+            var requestedInfoTypes = infoTypes ?? Array.Empty<XmlUpdateFragmentType>();
             var updateDataList = new List<UpdateData>();
 
-            if (infoTypes.Contains(XmlUpdateFragmentType.Extended))
+            if (requestedInfoTypes.Contains(XmlUpdateFragmentType.Extended))
             {
-                for (int i = 0; i < requestedUpdates.Count; i++)
+                foreach (var requestedUpdate in requestedUpdates)
                 {
-                    updateDataList.Add(new UpdateData()
+                    updateDataList.Add(new UpdateData
                     {
-                        ID = revisionIDs[i],
-                        Xml = GetExtendedFragment(requestedUpdates[i].Id)
+                        ID = requestedUpdate.RevisionId,
+                        Xml = GetExtendedFragment(requestedUpdate.Package.Id)
                     });
                 }
             }
-            
 
-            if (infoTypes.Contains(XmlUpdateFragmentType.LocalizedProperties))
+            if (requestedInfoTypes.Contains(XmlUpdateFragmentType.LocalizedProperties))
             {
-                for (int i = 0; i < requestedUpdates.Count; i++)
+                foreach (var requestedUpdate in requestedUpdates)
                 {
-                    var localizedXml = GetLocalizedProperties(requestedUpdates[i].Id, locales);
-
+                    var localizedXml = GetLocalizedProperties(
+                        requestedUpdate.Package.Id,
+                        locales);
                     if (!string.IsNullOrEmpty(localizedXml))
                     {
-                        updateDataList.Add(new UpdateData()
+                        updateDataList.Add(new UpdateData
                         {
-                            ID = revisionIDs[i],
-                            Xml = GetLocalizedProperties(requestedUpdates[i].Id, locales)
+                            ID = requestedUpdate.RevisionId,
+                            Xml = localizedXml
                         });
                     }
                 }
             }
 
-            var files = requestedUpdates.Where(u => u.Files != null && u.Files.Any()).SelectMany(u => u.Files.OfType<UpdateFile>()).Distinct().ToList();
-            var fileList = new List<FileLocation>();
-            for (int i = 0; i < files.Count; i++)
+            var files = requestedUpdates
+                .SelectMany(update => MetadataSource.GetFiles(update.Package.Id))
+                .GroupBy(file => file.Digest?.DigestBase64 ?? string.Empty, StringComparer.Ordinal)
+                .Select(group => group.First())
+                .ToList();
+            var fileList = files
+                .Select(file => GetFileLocation(file))
+                .Where(location => location != null)
+                .ToList();
+
+            return Task.FromResult(new ExtendedUpdateInfo
             {
-                var fileLocation = GetFileLocation(files[i]);
-                if (fileLocation != null)
-                {
-                    fileList.Add(fileLocation);
-                }
-            }
-
-            var response = new ExtendedUpdateInfo();
-
-            if (updateDataList.Count > 0)
-            {
-                response.Updates = updateDataList.ToArray();
-            }
-            
-            if (fileList.Count > 0)
-            {
-                response.FileLocations = fileList.ToArray();
-            }
-
-            MetadataSourceLock.ExitReadLock();
-
-            return Task.FromResult(response);
+                Updates = updateDataList.Count == 0 ? null : updateDataList.ToArray(),
+                FileLocations = fileList.Count == 0 ? null : fileList.ToArray()
+            });
         }
 
-        /// <summary>
-        /// Handle requests for update payload locations.
-        /// Returns Microsoft Update/CDN URLs when they are present in metadata so the client
-        /// downloads content directly from Microsoft instead of from this server.
-        /// </summary>
-        /// <param name="cookie">Access cookie</param>
-        /// <param name="fileDigests">Requested file digests</param>
-        /// <returns>File location response</returns>
-        public Task<GetFileLocationsResults> GetFileLocationsAsync(Cookie cookie, byte[][] fileDigests)
+        /// <inheritdoc />
+        public Task<GetFileLocationsResults> GetFileLocationsAsync(
+            Cookie cookie,
+            byte[][] fileDigests)
         {
-            MetadataSourceLock.EnterReadLock();
+            EnsureMetadataSourceAvailable();
+            var locations = MetadataSource
+                .GetFileLocations(fileDigests ?? Array.Empty<byte[]>())
+                .Select(location => new FileLocation
+                {
+                    FileDigest = location.Digest,
+                    Url = location.Url
+                })
+                .ToArray();
 
-            try
+            return Task.FromResult(new GetFileLocationsResults
             {
-                if (MetadataSource == null)
-                {
-                    throw new FaultException();
-                }
-
-                var requestedDigests = new HashSet<string>((fileDigests ?? Array.Empty<byte[]>()).Select(Convert.ToBase64String));
-                var fileList = new List<FileLocation>();
-
-                if (requestedDigests.Count > 0)
-                {
-                    var files = MetadataSource is IMicrosoftUpdateFileLocationLookup fileLocationLookup
-                        ? fileLocationLookup.FindFilesBySha1(fileDigests ?? Array.Empty<byte[]>()).Distinct().ToList()
-                        : MetadataSource
-                            .OfType<MicrosoftUpdatePackage>()
-                            .Where(u => u.Files != null && u.Files.Any())
-                            .SelectMany(u => u.Files.OfType<UpdateFile>())
-                            .Distinct()
-                            .ToList();
-
-                    foreach (var file in files)
-                    {
-                        foreach (var digest in file.Digests ?? Enumerable.Empty<ContentFileDigest>())
-                        {
-                            if (!requestedDigests.Contains(digest.DigestBase64))
-                            {
-                                continue;
-                            }
-
-                            var fileLocation = GetFileLocation(file, Convert.FromBase64String(digest.DigestBase64));
-                            if (fileLocation != null)
-                            {
-                                fileList.Add(fileLocation);
-                            }
-                        }
-                    }
-                }
-
-                return Task.FromResult(new GetFileLocationsResults()
-                {
-                    FileLocations = fileList.ToArray(),
-                    NewCookie = cookie
-                });
-            }
-            finally
-            {
-                MetadataSourceLock.ExitReadLock();
-            }
+                FileLocations = locations,
+                NewCookie = cookie
+            });
         }
 
-        /// <summary>
-        /// Not implemented
-        /// </summary>
-        /// <param name="request"></param>
-        /// <returns>Not implemented</returns>
         public Task<GetTimestampsResponse> GetTimestampsAsync(GetTimestampsRequest request)
         {
             throw new NotImplementedException();
         }
 
-        /// <summary>
-        /// Not implemented
-        /// </summary>
-        /// <param name="cookie"></param>
-        /// <param name="globalIDs"></param>
-        /// <param name="deviceAttributes"></param>
-        /// <returns>Not implemented</returns>
-        public Task<RefreshCacheResult[]> RefreshCacheAsync(Cookie cookie, UpdateIdentity[] globalIDs, string deviceAttributes)
+        public Task<RefreshCacheResult[]> RefreshCacheAsync(
+            Cookie cookie,
+            UpdateIdentity[] globalIDs,
+            string deviceAttributes)
         {
             throw new NotImplementedException();
         }
 
-        /// <summary>
-        /// Not implemented
-        /// </summary>
-        /// <param name="cookie"></param>
-        /// <param name="computerInfo"></param>
-        /// <returns>Not implemented</returns>
         public Task RegisterComputerAsync(Cookie cookie, ComputerInfo computerInfo)
         {
             throw new NotImplementedException();
         }
 
-        /// <summary>
-        /// Not implemented
-        /// </summary>
-        /// <param name="request"></param>
-        /// <returns>Not implemented</returns>
         public Task<StartCategoryScanResponse> StartCategoryScanAsync(StartCategoryScanRequest request)
         {
             throw new NotImplementedException();
         }
 
-        /// <summary>
-        /// Not implemented
-        /// </summary>
-        /// <param name="cookie"></param>
-        /// <param name="installedNonLeafUpdateIDs"></param>
-        /// <param name="printerUpdateIDs"></param>
-        /// <param name="deviceAttributes"></param>
-        /// <returns>Not implemented</returns>
-        public Task<SyncInfo> SyncPrinterCatalogAsync(Cookie cookie, int[] installedNonLeafUpdateIDs, int[] printerUpdateIDs, string deviceAttributes)
+        public Task<SyncInfo> SyncPrinterCatalogAsync(
+            Cookie cookie,
+            int[] installedNonLeafUpdateIDs,
+            int[] printerUpdateIDs,
+            string deviceAttributes)
         {
             throw new NotImplementedException();
         }
 
-        /// <summary>
-        /// Handle requests to sync updates. A client presents the list of installed updates and detectoids and the server
-        /// replies with a list of more applicable updates, if any.
-        /// </summary>
-        /// <param name="cookie">Access cookie</param>
-        /// <param name="parameters">Request parameters: list of installed updates, list of known updates, etc.</param>
-        /// <returns>SyncInfo containing updates applicable to the caller.</returns>
+        /// <inheritdoc />
         public Task<SyncInfo> SyncUpdatesAsync(Cookie cookie, SyncUpdateParameters parameters)
         {
-            if (parameters.SkipSoftwareSync)
+            EnsureMetadataSourceAvailable();
+            try
             {
-                return DoDriversSync(parameters);   
+                RecordObservedInventory(parameters);
             }
-            else
+            catch (Exception exception)
             {
-                return DoSoftwareUpdateSync(parameters);
+                System.Diagnostics.Trace.TraceError(
+                    $"Cannot record observed client inventory: {exception}");
             }
+
+            return parameters.SkipSoftwareSync
+                ? DoDriversSync(parameters)
+                : DoSoftwareUpdateSync(parameters);
         }
 
-        
-
-        /// <summary>
-        /// Converts the a list of client supplied update indexes into a list of update identities
-        /// </summary>
-        /// <param name="clientIndexes">Client update indexes (ints)</param>
-        /// <returns>List of update identities that correspond to the client's indexes</returns>
-        private List<MicrosoftUpdatePackageIdentity> GetUpdateIdentitiesFromClientIndexes(int[] clientIndexes)
+        private List<MicrosoftUpdatePackageIdentity> GetUpdateIdentitiesFromClientIndexes(
+            int[] clientIndexes)
         {
-            var updateIdentities = new List<MicrosoftUpdatePackageIdentity>();
-            if (clientIndexes != null)
+            var requested = clientIndexes ?? Array.Empty<int>();
+            var identitiesByRevision = MetadataSource.GetPackageIdentities(requested);
+            var identities = new List<MicrosoftUpdatePackageIdentity>(requested.Length);
+            foreach (var revisionId in requested)
             {
-                foreach (var nonLeafRevision in clientIndexes)
+                if (!identitiesByRevision.TryGetValue(revisionId, out var identity))
                 {
-                    if (!MetadataSourceIndex.TryGetValue(nonLeafRevision, out MicrosoftUpdatePackageIdentity nonLeafId))
-                    {
-                        throw new Exception("RevisionID not found");
-                    }
-
-                    updateIdentities.Add(nonLeafId);
+                    throw new FaultException($"Revision ID not found: {revisionId}");
                 }
+
+                identities.Add(identity);
             }
-            return updateIdentities;
+
+            return identities;
         }
 
-        /// <summary>
-        /// Extract installed non-leaf updates from the response and maps them to a GUID
-        /// </summary>
-        /// <param name="parameters">Sync parameters</param>
-        /// <returns>List of update GUIDs</returns>
-        private List<Guid> GetInstalledNotLeafGuidsFromSyncParameters(SyncUpdateParameters parameters)
+        private List<Guid> GetInstalledNotLeafGuidsFromSyncParameters(
+            SyncUpdateParameters parameters)
         {
-            return GetUpdateIdentitiesFromClientIndexes(parameters.InstalledNonLeafUpdateIDs)
-                .Select(u => u.ID)
+            return GetUpdateIdentitiesFromClientIndexes(
+                    parameters.InstalledNonLeafUpdateIDs)
+                .Select(update => update.ID)
                 .ToList();
         }
 
-        /// <summary>
-        /// Extract list of other known updates from the client and maps them to a  GUID
-        /// </summary>
-        /// <param name="parameters">Sync parameters</param>
-        /// <returns>List of update GUIDs</returns>
-        private List<Guid> GetOtherCachedUpdateGuidsFromSyncParameters(SyncUpdateParameters parameters)
+        private List<Guid> GetOtherCachedUpdateGuidsFromSyncParameters(
+            SyncUpdateParameters parameters)
         {
             return GetUpdateIdentitiesFromClientIndexes(parameters.OtherCachedUpdateIDs)
-                .Select(u => u.ID)
+                .Select(update => update.ID)
                 .ToList();
         }
     }

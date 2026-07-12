@@ -28,7 +28,8 @@
         </member>
         <member name="M:Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync.ClientSyncWebService.SetContentURLBase(System.String)">
             <summary>
-            Sets the host name for the server that serves the update content
+            Sets the host name for the server that serves the update content.
+            Microsoft Update URLs are still preferred when they are available in metadata.
             </summary>
             <param name="hostName"></param>
         </member>
@@ -71,14 +72,15 @@
         </member>
         <member name="M:Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync.ClientSyncWebService.GetExtendedUpdateInfo2Async(Microsoft.UpdateServices.WebServices.ClientSync.Cookie,Microsoft.UpdateServices.WebServices.ClientSync.UpdateIdentity[],Microsoft.UpdateServices.WebServices.ClientSync.XmlUpdateFragmentType[],System.String[],System.String)">
             <summary>
-            Not implemented.
+            Handle requests for extended update information using global update identities.
+            This mirrors GetExtendedUpdateInfoAsync and also returns Microsoft Update/CDN file URLs.
             </summary>
-            <param name="cookie">Not implemented</param>
-            <param name="updateIDs">Not implemented</param>
-            <param name="infoTypes">Not implemented</param>
-            <param name="locales">Not implemented</param>
-            <param name="deviceAttributes">Not implemented</param>
-            <returns>Not implemented</returns>
+            <param name="cookie">Access cookie</param>
+            <param name="updateIDs">Update identities</param>
+            <param name="infoTypes">The type of extended information requested</param>
+            <param name="locales">The language to use when getting language dependent extended information</param>
+            <param name="deviceAttributes">Device attributes; unused</param>
+            <returns>Extended update information response.</returns>
         </member>
         <member name="M:Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync.ClientSyncWebService.GetExtendedUpdateInfoAsync(Microsoft.UpdateServices.WebServices.ClientSync.Cookie,System.Int32[],Microsoft.UpdateServices.WebServices.ClientSync.XmlUpdateFragmentType[],System.String[],System.String)">
             <summary>
@@ -94,11 +96,13 @@
         </member>
         <member name="M:Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync.ClientSyncWebService.GetFileLocationsAsync(Microsoft.UpdateServices.WebServices.ClientSync.Cookie,System.Byte[][])">
             <summary>
-            Not implemented
+            Handle requests for update payload locations.
+            Returns Microsoft Update/CDN URLs when they are present in metadata so the client
+            downloads content directly from Microsoft instead of from this server.
             </summary>
-            <param name="cookie"></param>
-            <param name="fileDigests"></param>
-            <returns>Not implemented</returns>
+            <param name="cookie">Access cookie</param>
+            <param name="fileDigests">Requested file digests</param>
+            <returns>File location response</returns>
         </member>
         <member name="M:Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync.ClientSyncWebService.GetTimestampsAsync(Microsoft.UpdateServices.WebServices.ClientSync.GetTimestampsRequest)">
             <summary>
@@ -257,6 +261,13 @@
             <param name="hardwareIdList">The list of hardware ids for the device</param>
             <param name="computerHardwareIds">List of computer hardware ids</param>
             <returns>True if the installed driver is a better match, false otherwise</returns>
+        </member>
+        <member name="M:Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync.ClientSyncWebService.RecordObservedInventory(Microsoft.UpdateServices.WebServices.ClientSync.SyncUpdateParameters)">
+            <summary>
+            Records the fleet-wide union of detectoids and hardware identifiers
+            reported by a Windows Update client. This method only writes to the
+            local metadata store and never contacts Microsoft Update.
+            </summary>
         </member>
         <member name="M:Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync.ClientSyncWebService.DoSoftwareUpdateSync(Microsoft.UpdateServices.WebServices.ClientSync.SyncUpdateParameters)">
             <summary>
