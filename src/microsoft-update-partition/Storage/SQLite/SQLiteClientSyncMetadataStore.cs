@@ -996,7 +996,7 @@ SELECT package_index, identity
 FROM packages
 WHERE published = 1
   {(observedDetectorsOnly
-      ? "AND package_type IN ($detectoidType, $productType)"
+      ? "AND package_type = $detectoidType"
       : string.Empty)}
   AND package_index IN ({string.Join(", ", parameterNames)});";
                 if (observedDetectorsOnly)
@@ -1004,9 +1004,6 @@ WHERE published = 1
                     command.Parameters.AddWithValue(
                         "$detectoidType",
                         (int)StoredPackageType.MicrosoftUpdateDetectoid);
-                    command.Parameters.AddWithValue(
-                        "$productType",
-                        (int)StoredPackageType.MicrosoftUpdateProduct);
                 }
 
                 using var reader = command.ExecuteReader();

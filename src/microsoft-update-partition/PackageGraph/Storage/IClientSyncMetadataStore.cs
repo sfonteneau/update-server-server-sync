@@ -77,8 +77,9 @@ namespace Microsoft.PackageGraph.Storage
             IEnumerable<int> revisionIds);
 
         /// <summary>
-        /// Resolves published local revision IDs that can describe installed products:
-        /// detectoids and Microsoft Update product-category nodes.
+        /// Resolves published local revision IDs that are actual detectoid packages.
+        /// Product-category nodes are intentionally excluded because WUA may report
+        /// broad category nodes that do not prove a product is installed.
         /// </summary>
         IReadOnlyDictionary<int, MicrosoftUpdatePackageIdentity> GetObservedDetectorIdentities(
             IEnumerable<int> revisionIds);

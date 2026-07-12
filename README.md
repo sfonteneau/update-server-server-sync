@@ -42,3 +42,9 @@ provided by the bot. You will only need to do this once across all repos using o
 This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
 For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
 contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+
+## Observed fleet synchronization operations
+
+This fork can record products and hardware identifiers reported by Windows Update clients, then synchronize only the observed scopes with the scheduled `fetch-observed` command. Operational commands are documented in [PATCH_LOT4_OPERATIONS.md](PATCH_LOT4_OPERATIONS.md).
+The client-facing server now reads published rows directly from SQLite, without a
+catalog cache or polling loop.
