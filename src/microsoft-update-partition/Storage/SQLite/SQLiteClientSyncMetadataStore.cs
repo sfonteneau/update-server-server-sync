@@ -72,6 +72,36 @@ namespace Microsoft.PackageGraph.Storage.Local
 
             using var connection = OpenConnection();
             ValidateSchema(connection);
+            TracePublishedCatalogSummary(connection);
+        }
+
+        private static void TracePublishedCatalogSummary(SqliteConnection connection)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+SELECT
+    (SELECT COUNT(*) FROM packages WHERE published = 1),
+    (SELECT COUNT(*) FROM client_sync_graph),
+    (SELECT COUNT(*)
+       FROM client_sync_graph
+      WHERE package_type = $softwareType),
+    (SELECT COUNT(*)
+       FROM client_sync_graph
+      WHERE package_type = $driverType),
+    (SELECT COUNT(*) FROM client_sync_driver_hardware_ids AS driver
+       JOIN client_sync_graph AS graph ON graph.package_index = driver.package_index);";
+            command.Parameters.AddWithValue("$softwareType", (int)StoredPackageType.MicrosoftUpdateSoftware);
+            command.Parameters.AddWithValue("$driverType", (int)StoredPackageType.MicrosoftUpdateDriver);
+            using var reader = command.ExecuteReader();
+            if (!reader.Read())
+            {
+                return;
+            }
+
+            Trace.TraceInformation(
+                $"Published SQLite catalog: packages={reader.GetInt64(0)}, graph={reader.GetInt64(1)}, " +
+                $"software={reader.GetInt64(2)}, drivers={reader.GetInt64(3)}, " +
+                $"driver_hardware_rows={reader.GetInt64(4)}.");
         }
 
         public MetadataStoreGenerationInfo GetPublishedCatalogInfo()
@@ -716,8 +746,7 @@ LIMIT 1;";
             {
                 ClientSyncSoftwareStage.Root => @"
 graph.package_type < $driverType
-AND graph.has_prerequisites = 0
-AND graph.has_dependents = 1",
+AND graph.has_prerequisites = 0",
                 ClientSyncSoftwareStage.NonLeaf => @"
 graph.package_type < $driverType
 AND graph.has_prerequisites = 1

@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
@@ -11,6 +11,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
     {
         readonly private HashSet<MicrosoftUpdatePackageIdentity> ApprovedSoftwareUpdates;
         private bool AreAllSoftwareUpdatesApproved = true;
+        private bool AreAllDriverUpdatesApproved = true;
         readonly private HashSet<MicrosoftUpdatePackageIdentity> ApprovedDriverUpdates;
 
         /// <summary>
@@ -63,6 +64,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         /// <param name="approvedUpdate">Approved driver update</param>
         public void AddApprovedDriverUpdate(MicrosoftUpdatePackageIdentity approvedUpdate)
         {
+            AreAllDriverUpdatesApproved = false;
             ApprovedDriverUpdates.Add(approvedUpdate);
         }
 
@@ -73,6 +75,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         /// <param name="approvedUpdates"></param>
         public void AddApprovedDriverUpdates(IEnumerable<MicrosoftUpdatePackageIdentity> approvedUpdates)
         {
+            AreAllDriverUpdatesApproved = false;
             foreach (var approvedUpdate in approvedUpdates)
             {
                 ApprovedDriverUpdates.Add(approvedUpdate);

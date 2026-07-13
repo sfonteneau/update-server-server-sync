@@ -4341,6 +4341,55 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
             }
         }
 
+        private bool HasUnpublishedPackages()
+        {
+            using var command = Connection.CreateCommand();
+            command.CommandText = "SELECT EXISTS(SELECT 1 FROM packages WHERE published = 0 LIMIT 1);";
+            return Convert.ToInt32(command.ExecuteScalar(), CultureInfo.InvariantCulture) != 0;
+        }
+
+        private bool ClientSyncGraphNeedsRebuild()
+        {
+            using var command = Connection.CreateCommand();
+            command.CommandText = @"
+WITH expected AS (
+    SELECT sync_package.package_index
+    FROM client_sync_packages AS sync_package
+    JOIN packages AS package
+      ON package.package_index = sync_package.package_index
+     AND package.published = 1
+    JOIN (
+        SELECT sync_package.update_id, MAX(sync_package.revision_number) AS revision_number
+        FROM client_sync_packages AS sync_package
+        JOIN packages AS package
+          ON package.package_index = sync_package.package_index
+         AND package.published = 1
+        GROUP BY sync_package.update_id
+    ) AS latest
+      ON latest.update_id = sync_package.update_id
+     AND latest.revision_number = sync_package.revision_number
+),
+difference AS (
+    SELECT package_index
+    FROM (
+        SELECT package_index FROM expected
+        EXCEPT
+        SELECT package_index FROM client_sync_graph
+    )
+
+    UNION ALL
+
+    SELECT package_index
+    FROM (
+        SELECT package_index FROM client_sync_graph
+        EXCEPT
+        SELECT package_index FROM expected
+    )
+)
+SELECT EXISTS(SELECT 1 FROM difference LIMIT 1);";
+            return Convert.ToInt32(command.ExecuteScalar(), CultureInfo.InvariantCulture) != 0;
+        }
+
         public MetadataStoreGenerationInfo PublishDeferredCatalogChanges()
         {
             StateLock.EnterWriteLock();
@@ -4354,7 +4403,9 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
                     PendingPackages.Clear();
                 }
 
-                if (CatalogGenerationDirty)
+                if (CatalogGenerationDirty
+                    || HasUnpublishedPackages()
+                    || ClientSyncGraphNeedsRebuild())
                 {
                     LoadedMetadataGeneration = PublishCatalogGeneration();
                     CatalogGenerationDirty = false;
