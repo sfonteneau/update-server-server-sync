@@ -64,9 +64,6 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                 response,
                 nonLeafResponse: false))
             {
-                // WUA must call again after learning about bundle members so the
-                // final non-bundled leaf stage can be reached.
-                response.Truncated = true;
                 return Task.FromResult(response);
             }
 
@@ -104,12 +101,14 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                 ? CreateUpdateInfoListFromNonLeafUpdates(packages).ToArray()
                 : CreateUpdateInfoListFromSoftwareUpdates(packages).ToArray();
 
-            // Root/non-leaf discovery is deliberately staged. Even when the current
-            // query fits in one response, WUA must call SyncUpdates again to proceed
-            // to the next graph level. The final leaf stage uses true SQL truncation.
-            response.Truncated = stage == ClientSyncSoftwareStage.Leaf
-                ? truncated
-                : true;
+            // Discovery remains staged, but Truncated is only set when the current
+            // stage overflowed or a later graph level actually contains a candidate.
+            response.Truncated = truncated || MetadataSource.HasLaterSoftwareCandidates(
+                stage,
+                installedNonLeaf,
+                otherCached,
+                AreAllSoftwareUpdatesApproved,
+                ApprovedSoftwareUpdates.ToArray());
             return true;
         }
 

@@ -8,18 +8,19 @@ using Microsoft.PackageGraph.Storage;
 using Microsoft.UpdateServices.WebServices.ClientSync;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.ServiceModel;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
 {
     /// <summary>
-    /// Update server implementation. The client-facing service reads the published
-    /// catalog directly from SQLite for every request and does not retain a package
-    /// catalog, prerequisite graph, driver index or metadata object cache in memory.
+    /// Update server implementation. The client-facing service reads a precomputed
+    /// SQLite graph and driver index, with a bounded metadata cache for selected packages.
     /// </summary>
     public partial class ClientSyncWebService : IClientSyncWebService
     {
@@ -30,6 +31,8 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
 
         private Config ServiceConfiguration;
         private const int MaxUpdatesInResponse = 50;
+        private static readonly SemaphoreSlim ScanConcurrencyGate = new(1, 1);
+        private static long ScanSequence;
         private string ContentRoot;
 
         /// <summary>
@@ -424,22 +427,55 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         }
 
         /// <inheritdoc />
-        public Task<SyncInfo> SyncUpdatesAsync(Cookie cookie, SyncUpdateParameters parameters)
+        public async Task<SyncInfo> SyncUpdatesAsync(Cookie cookie, SyncUpdateParameters parameters)
         {
             EnsureMetadataSourceAvailable();
+            parameters ??= new SyncUpdateParameters();
+            var scanId = Interlocked.Increment(ref ScanSequence);
+            var scanType = parameters.SkipSoftwareSync ? "drivers" : "software";
+            var queueStopwatch = Stopwatch.StartNew();
+            await ScanConcurrencyGate.WaitAsync().ConfigureAwait(false);
+            queueStopwatch.Stop();
+
+            var totalStopwatch = Stopwatch.StartNew();
+            using var process = Process.GetCurrentProcess();
+            var cpuBefore = process.TotalProcessorTime;
+            Trace.TraceInformation(
+                $"Client scan {scanId} started: type={scanType}, queue_ms={queueStopwatch.ElapsedMilliseconds}, " +
+                $"devices={parameters.SystemSpec?.Length ?? 0}, installed_non_leaf={parameters.InstalledNonLeafUpdateIDs?.Length ?? 0}, " +
+                $"other_cached={parameters.OtherCachedUpdateIDs?.Length ?? 0}, cached_drivers={parameters.CachedDriverIDs?.Length ?? 0}.");
+
             try
             {
-                RecordObservedInventory(parameters);
+                try
+                {
+                    RecordObservedInventory(parameters);
+                }
+                catch (Exception exception)
+                {
+                    Trace.TraceError(
+                        $"Client scan {scanId}: cannot record observed client inventory: {exception}");
+                }
+
+                return parameters.SkipSoftwareSync
+                    ? await DoDriversSync(parameters).ConfigureAwait(false)
+                    : await DoSoftwareUpdateSync(parameters).ConfigureAwait(false);
             }
             catch (Exception exception)
             {
-                System.Diagnostics.Trace.TraceError(
-                    $"Cannot record observed client inventory: {exception}");
+                Trace.TraceError(
+                    $"Client scan {scanId} failed after {totalStopwatch.ElapsedMilliseconds} ms: {exception}");
+                throw;
             }
-
-            return parameters.SkipSoftwareSync
-                ? DoDriversSync(parameters)
-                : DoSoftwareUpdateSync(parameters);
+            finally
+            {
+                totalStopwatch.Stop();
+                var cpuUsed = process.TotalProcessorTime - cpuBefore;
+                Trace.TraceInformation(
+                    $"Client scan {scanId} completed: type={scanType}, total_ms={totalStopwatch.ElapsedMilliseconds}, " +
+                    $"process_cpu_ms={cpuUsed.TotalMilliseconds:F0}.");
+                ScanConcurrencyGate.Release();
+            }
         }
 
         private List<MicrosoftUpdatePackageIdentity> GetUpdateIdentitiesFromClientIndexes(

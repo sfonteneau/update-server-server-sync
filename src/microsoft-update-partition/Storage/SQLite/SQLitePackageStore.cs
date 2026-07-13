@@ -38,7 +38,7 @@ namespace Microsoft.PackageGraph.Storage.Local
     {
         public const string DatabaseFileName = "metadata.sqlite";
 
-        private const int SchemaVersion = 8;
+        private const int SchemaVersion = 9;
         private const string IndexBlobKey = "indexes.zip";
         private const string CompressionNone = "none";
         private const string CompressionBrotli = "br";
@@ -217,16 +217,42 @@ CREATE TABLE IF NOT EXISTS client_sync_packages (
 CREATE INDEX IF NOT EXISTS idx_client_sync_packages_update
 ON client_sync_packages(update_id, revision_number, package_index);
 
+CREATE TABLE IF NOT EXISTS client_sync_graph (
+    package_index INTEGER PRIMARY KEY,
+    update_id TEXT NOT NULL,
+    revision_number INTEGER NOT NULL,
+    package_type INTEGER NOT NULL,
+    has_prerequisites INTEGER NOT NULL CHECK(has_prerequisites IN (0, 1)),
+    has_dependents INTEGER NOT NULL CHECK(has_dependents IN (0, 1)),
+    is_bundle INTEGER NOT NULL CHECK(is_bundle IN (0, 1)),
+    is_bundled INTEGER NOT NULL CHECK(is_bundled IN (0, 1)),
+    is_superseded INTEGER NOT NULL CHECK(is_superseded IN (0, 1)),
+    FOREIGN KEY(package_index) REFERENCES packages(package_index) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_client_sync_graph_update
+ON client_sync_graph(update_id);
+
+CREATE INDEX IF NOT EXISTS idx_client_sync_graph_stage
+ON client_sync_graph(package_type, has_prerequisites, has_dependents, is_superseded, is_bundled, package_index);
+
+CREATE INDEX IF NOT EXISTS idx_client_sync_graph_topology
+ON client_sync_graph(has_prerequisites, has_dependents, package_index, package_type);
+
 CREATE TABLE IF NOT EXISTS client_sync_prerequisites (
     package_index INTEGER NOT NULL,
+    group_ordinal INTEGER NOT NULL,
     prerequisite_update_id TEXT NOT NULL,
     is_category INTEGER NOT NULL DEFAULT 0 CHECK(is_category IN (0, 1)),
-    PRIMARY KEY(package_index, prerequisite_update_id, is_category),
+    PRIMARY KEY(package_index, group_ordinal, prerequisite_update_id),
     FOREIGN KEY(package_index) REFERENCES packages(package_index) ON DELETE CASCADE
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_client_sync_prerequisites_target
-ON client_sync_prerequisites(prerequisite_update_id, package_index);
+ON client_sync_prerequisites(prerequisite_update_id, package_index, group_ordinal);
+
+CREATE INDEX IF NOT EXISTS idx_client_sync_prerequisites_package_group
+ON client_sync_prerequisites(package_index, group_ordinal, prerequisite_update_id);
 
 CREATE TABLE IF NOT EXISTS client_sync_supersedence (
     superseding_package_index INTEGER NOT NULL,
@@ -253,12 +279,38 @@ CREATE TABLE IF NOT EXISTS client_sync_driver_hardware_ids (
     package_index INTEGER NOT NULL,
     metadata_ordinal INTEGER NOT NULL,
     hardware_id TEXT NOT NULL,
+    driver_date_ticks INTEGER NOT NULL,
+    driver_version TEXT NOT NULL,
     PRIMARY KEY(package_index, metadata_ordinal),
     FOREIGN KEY(package_index) REFERENCES packages(package_index) ON DELETE CASCADE
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_client_sync_driver_hardware_id
-ON client_sync_driver_hardware_ids(hardware_id, package_index, metadata_ordinal);
+ON client_sync_driver_hardware_ids(hardware_id, driver_date_ticks DESC, driver_version DESC, package_index, metadata_ordinal);
+
+CREATE TABLE IF NOT EXISTS client_sync_driver_computer_ids (
+    package_index INTEGER NOT NULL,
+    metadata_ordinal INTEGER NOT NULL,
+    computer_id TEXT NOT NULL,
+    PRIMARY KEY(package_index, metadata_ordinal, computer_id),
+    FOREIGN KEY(package_index, metadata_ordinal)
+        REFERENCES client_sync_driver_hardware_ids(package_index, metadata_ordinal)
+        ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_client_sync_driver_computer_id
+ON client_sync_driver_computer_ids(computer_id, package_index, metadata_ordinal);
+
+CREATE TABLE IF NOT EXISTS client_sync_driver_feature_scores (
+    package_index INTEGER NOT NULL,
+    metadata_ordinal INTEGER NOT NULL,
+    operating_system TEXT NOT NULL,
+    score INTEGER NOT NULL CHECK(score BETWEEN 0 AND 255),
+    PRIMARY KEY(package_index, metadata_ordinal, operating_system, score),
+    FOREIGN KEY(package_index, metadata_ordinal)
+        REFERENCES client_sync_driver_hardware_ids(package_index, metadata_ordinal)
+        ON DELETE CASCADE
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS store_blobs (
     key TEXT PRIMARY KEY,
@@ -474,10 +526,13 @@ WHERE type = 'table'
             {
                 "packages",
                 "client_sync_packages",
+                "client_sync_graph",
                 "client_sync_prerequisites",
                 "client_sync_supersedence",
                 "client_sync_bundles",
                 "client_sync_driver_hardware_ids",
+                "client_sync_driver_computer_ids",
+                "client_sync_driver_feature_scores",
                 "file_locations",
                 "package_file_map",
                 "observed_detectoids",
@@ -691,6 +746,7 @@ ORDER BY package_index;";
         {
             var changedAt = DateTimeOffset.UtcNow;
             var changedAtText = changedAt.ToString("O", CultureInfo.InvariantCulture);
+            var rebuildStopwatch = System.Diagnostics.Stopwatch.StartNew();
 
             using var transaction = Connection.BeginTransaction();
             using (var publishPackagesCommand = Connection.CreateCommand())
@@ -702,6 +758,8 @@ SET published = 1
 WHERE published = 0;";
                 publishPackagesCommand.ExecuteNonQuery();
             }
+
+            RebuildClientSyncGraph(transaction);
 
             using (var generationCommand = Connection.CreateCommand())
             {
@@ -755,12 +813,115 @@ WHERE key = 'catalog_generation';";
             }
 
             transaction.Commit();
+            rebuildStopwatch.Stop();
+            System.Diagnostics.Trace.TraceInformation(
+                $"Published catalog generation {generation}; rebuilt the client-sync graph in " +
+                $"{rebuildStopwatch.ElapsedMilliseconds} ms.");
             IsCatalogGenerationPublicationDeferred = false;
             return new MetadataStoreGenerationInfo(
                 generation,
                 changedAt,
                 publicationDeferred: false,
                 hasUnpublishedChanges: false);
+        }
+
+        private void RebuildClientSyncGraph(SqliteTransaction transaction)
+        {
+            using (var deleteCommand = Connection.CreateCommand())
+            {
+                deleteCommand.Transaction = transaction;
+                deleteCommand.CommandText = "DELETE FROM client_sync_graph;";
+                deleteCommand.ExecuteNonQuery();
+            }
+
+            using var insertCommand = Connection.CreateCommand();
+            insertCommand.Transaction = transaction;
+            insertCommand.CommandText = @"
+WITH latest AS (
+    SELECT sync_package.update_id, MAX(sync_package.revision_number) AS revision_number
+    FROM client_sync_packages AS sync_package
+    JOIN packages AS package
+      ON package.package_index = sync_package.package_index
+     AND package.published = 1
+    GROUP BY sync_package.update_id
+),
+prerequisite_updates AS (
+    SELECT DISTINCT sync_package.update_id
+    FROM client_sync_packages AS sync_package
+    JOIN packages AS package
+      ON package.package_index = sync_package.package_index
+     AND package.published = 1
+    JOIN client_sync_prerequisites AS prerequisite
+      ON prerequisite.package_index = sync_package.package_index
+),
+dependent_updates AS (
+    SELECT DISTINCT prerequisite.prerequisite_update_id AS update_id
+    FROM client_sync_prerequisites AS prerequisite
+    JOIN packages AS package
+      ON package.package_index = prerequisite.package_index
+     AND package.published = 1
+),
+bundle_packages AS (
+    SELECT DISTINCT bundle.bundle_package_index AS package_index
+    FROM client_sync_bundles AS bundle
+    JOIN packages AS package
+      ON package.package_index = bundle.bundle_package_index
+     AND package.published = 1
+),
+bundled_updates AS (
+    SELECT DISTINCT bundle.bundled_update_id, bundle.bundled_revision_number
+    FROM client_sync_bundles AS bundle
+    JOIN packages AS package
+      ON package.package_index = bundle.bundle_package_index
+     AND package.published = 1
+),
+superseded_updates AS (
+    SELECT DISTINCT supersedence.superseded_update_id AS update_id
+    FROM client_sync_supersedence AS supersedence
+    JOIN packages AS package
+      ON package.package_index = supersedence.superseding_package_index
+     AND package.published = 1
+)
+INSERT INTO client_sync_graph(
+    package_index,
+    update_id,
+    revision_number,
+    package_type,
+    has_prerequisites,
+    has_dependents,
+    is_bundle,
+    is_bundled,
+    is_superseded)
+SELECT
+    package.package_index,
+    sync_package.update_id,
+    sync_package.revision_number,
+    package.package_type,
+    CASE WHEN prerequisite_updates.update_id IS NULL THEN 0 ELSE 1 END,
+    CASE WHEN dependent_updates.update_id IS NULL THEN 0 ELSE 1 END,
+    CASE WHEN bundle_packages.package_index IS NULL THEN 0 ELSE 1 END,
+    CASE WHEN bundled_updates.bundled_update_id IS NULL THEN 0 ELSE 1 END,
+    CASE WHEN superseded_updates.update_id IS NULL THEN 0 ELSE 1 END
+FROM latest
+JOIN client_sync_packages AS sync_package
+  ON sync_package.update_id = latest.update_id
+ AND sync_package.revision_number = latest.revision_number
+JOIN packages AS package
+  ON package.package_index = sync_package.package_index
+ AND package.published = 1
+LEFT JOIN prerequisite_updates
+  ON prerequisite_updates.update_id = sync_package.update_id
+LEFT JOIN dependent_updates
+  ON dependent_updates.update_id = sync_package.update_id
+LEFT JOIN bundle_packages
+  ON bundle_packages.package_index = package.package_index
+LEFT JOIN bundled_updates
+  ON bundled_updates.bundled_update_id = sync_package.update_id
+ AND bundled_updates.bundled_revision_number = sync_package.revision_number
+LEFT JOIN superseded_updates
+  ON superseded_updates.update_id = sync_package.update_id;";
+            insertCommand.ExecuteNonQuery();
+
         }
 
         private void PersistUnpublishedCatalogChanges()
@@ -3511,16 +3672,20 @@ VALUES ($packageIndex, $updateId, $revisionNumber);";
             command.CommandText = @"
 INSERT OR IGNORE INTO client_sync_prerequisites(
     package_index,
+    group_ordinal,
     prerequisite_update_id,
     is_category)
-VALUES ($packageIndex, $updateId, $isCategory);";
+VALUES ($packageIndex, $groupOrdinal, $updateId, $isCategory);";
             command.Parameters.AddWithValue("$packageIndex", packageIndex);
+            var groupOrdinalParameter = command.Parameters.Add("$groupOrdinal", SqliteType.Integer);
             var updateIdParameter = command.Parameters.Add("$updateId", SqliteType.Text);
             var isCategoryParameter = command.Parameters.Add("$isCategory", SqliteType.Integer);
             command.Prepare();
 
-            foreach (var prerequisite in prerequisites)
+            for (var groupOrdinal = 0; groupOrdinal < prerequisites.Count; groupOrdinal++)
             {
+                var prerequisite = prerequisites[groupOrdinal];
+                groupOrdinalParameter.Value = groupOrdinal;
                 if (prerequisite is Simple simple)
                 {
                     updateIdParameter.Value = simple.UpdateId.ToString("D");
@@ -3617,16 +3782,49 @@ VALUES ($packageIndex, $updateId, $revisionNumber);";
 INSERT OR IGNORE INTO client_sync_driver_hardware_ids(
     package_index,
     metadata_ordinal,
-    hardware_id)
-VALUES ($packageIndex, $metadataOrdinal, $hardwareId);";
+    hardware_id,
+    driver_date_ticks,
+    driver_version)
+VALUES ($packageIndex, $metadataOrdinal, $hardwareId, $driverDateTicks, $driverVersion);";
             command.Parameters.AddWithValue("$packageIndex", packageIndex);
             var ordinalParameter = command.Parameters.Add("$metadataOrdinal", SqliteType.Integer);
             var hardwareIdParameter = command.Parameters.Add("$hardwareId", SqliteType.Text);
+            var driverDateParameter = command.Parameters.Add("$driverDateTicks", SqliteType.Integer);
+            var driverVersionParameter = command.Parameters.Add("$driverVersion", SqliteType.Text);
             command.Prepare();
+
+            using var computerIdCommand = Connection.CreateCommand();
+            computerIdCommand.Transaction = transaction;
+            computerIdCommand.CommandText = @"
+INSERT OR IGNORE INTO client_sync_driver_computer_ids(
+    package_index,
+    metadata_ordinal,
+    computer_id)
+VALUES ($packageIndex, $metadataOrdinal, $computerId);";
+            computerIdCommand.Parameters.AddWithValue("$packageIndex", packageIndex);
+            var computerOrdinalParameter = computerIdCommand.Parameters.Add("$metadataOrdinal", SqliteType.Integer);
+            var computerIdParameter = computerIdCommand.Parameters.Add("$computerId", SqliteType.Text);
+            computerIdCommand.Prepare();
+
+            using var featureScoreCommand = Connection.CreateCommand();
+            featureScoreCommand.Transaction = transaction;
+            featureScoreCommand.CommandText = @"
+INSERT OR IGNORE INTO client_sync_driver_feature_scores(
+    package_index,
+    metadata_ordinal,
+    operating_system,
+    score)
+VALUES ($packageIndex, $metadataOrdinal, $operatingSystem, $score);";
+            featureScoreCommand.Parameters.AddWithValue("$packageIndex", packageIndex);
+            var featureOrdinalParameter = featureScoreCommand.Parameters.Add("$metadataOrdinal", SqliteType.Integer);
+            var operatingSystemParameter = featureScoreCommand.Parameters.Add("$operatingSystem", SqliteType.Text);
+            var scoreParameter = featureScoreCommand.Parameters.Add("$score", SqliteType.Integer);
+            featureScoreCommand.Prepare();
 
             for (var index = 0; index < metadata.Count; index++)
             {
-                var hardwareId = metadata[index]?.HardwareID;
+                var driverMetadata = metadata[index];
+                var hardwareId = driverMetadata?.HardwareID;
                 if (string.IsNullOrWhiteSpace(hardwareId))
                 {
                     continue;
@@ -3634,8 +3832,48 @@ VALUES ($packageIndex, $metadataOrdinal, $hardwareId);";
 
                 ordinalParameter.Value = index;
                 hardwareIdParameter.Value = hardwareId.Trim().ToLowerInvariant();
+                driverDateParameter.Value = driverMetadata.Versioning?.Date.Ticks ?? 0L;
+                driverVersionParameter.Value = (driverMetadata.Versioning?.Version ?? 0UL)
+                    .ToString("D20", CultureInfo.InvariantCulture);
                 command.ExecuteNonQuery();
+
+                computerOrdinalParameter.Value = index;
+                foreach (var computerId in GetEffectiveComputerHardwareIds(driverMetadata).Distinct())
+                {
+                    computerIdParameter.Value = computerId.ToString("D");
+                    computerIdCommand.ExecuteNonQuery();
+                }
+
+                featureOrdinalParameter.Value = index;
+                foreach (var featureScore in driverMetadata.FeatureScores ?? Enumerable.Empty<DriverFeatureScore>())
+                {
+                    operatingSystemParameter.Value = featureScore.OperatingSystem ?? string.Empty;
+                    scoreParameter.Value = featureScore.Score;
+                    featureScoreCommand.ExecuteNonQuery();
+                }
             }
+        }
+
+        private static IReadOnlyList<Guid> GetEffectiveComputerHardwareIds(DriverMetadata metadata)
+        {
+            var target = metadata?.TargetComputerHardwareId ?? new List<Guid>();
+            var distribution = metadata?.DistributionComputerHardwareId ?? new List<Guid>();
+            if (target.Count > 0 && distribution.Count > 0)
+            {
+                return target.Intersect(distribution).ToList();
+            }
+
+            if (target.Count > 0)
+            {
+                return target;
+            }
+
+            if (distribution.Count > 0)
+            {
+                return distribution;
+            }
+
+            return Array.Empty<Guid>();
         }
 
         private void InsertFileLocations(IPackage package, int packageIndex, SqliteTransaction transaction)

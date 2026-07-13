@@ -22,7 +22,8 @@ namespace Microsoft.PackageGraph.Storage
     }
 
     /// <summary>
-    /// A package materialized for one client request. It is not retained by the store.
+    /// A published package record returned to one client request. The store may
+    /// retain the underlying package in its bounded metadata cache.
     /// </summary>
     public sealed class ClientSyncPackageRecord
     {
@@ -61,8 +62,8 @@ namespace Microsoft.PackageGraph.Storage
 
     /// <summary>
     /// Direct SQLite read model used by the client-facing WSUS endpoint.
-    /// Implementations must not retain the catalog, indexes or package graph in an
-    /// application-level cache. SQLite and the operating system remain free to cache pages.
+    /// Implementations may retain a bounded cache of selected package metadata, but
+    /// the complete catalog and dependency graph remain materialized in SQLite.
     /// </summary>
     public interface IClientSyncMetadataStore : IDisposable
     {
@@ -106,8 +107,8 @@ namespace Microsoft.PackageGraph.Storage
 
         /// <summary>
         /// Selects the next software discovery response directly from SQLite.
-        /// Applicability and approvals are evaluated while rows are streamed, and only
-        /// the returned packages are materialized.
+        /// Applicability and approvals are evaluated in SQL, and only the returned
+        /// packages are materialized.
         /// </summary>
         IReadOnlyList<ClientSyncPackageRecord> GetSoftwareCandidates(
             ClientSyncSoftwareStage stage,
@@ -117,6 +118,18 @@ namespace Microsoft.PackageGraph.Storage
             IReadOnlyCollection<MicrosoftUpdatePackageIdentity> approvedSoftwareUpdates,
             int maxResults,
             out bool truncated);
+
+        /// <summary>
+        /// Returns whether a later software-discovery stage still contains a
+        /// published candidate. Applicability is intentionally not evaluated because
+        /// the current response can make later graph levels applicable on the next call.
+        /// </summary>
+        bool HasLaterSoftwareCandidates(
+            ClientSyncSoftwareStage currentStage,
+            IReadOnlyCollection<Guid> installedNonLeafUpdateIds,
+            IReadOnlyCollection<Guid> otherCachedUpdateIds,
+            bool approveAllSoftwareUpdates,
+            IReadOnlyCollection<MicrosoftUpdatePackageIdentity> approvedSoftwareUpdates);
 
         /// <summary>Finds the best published driver for a device directly from SQLite.</summary>
         DriverMatchResult MatchDriver(

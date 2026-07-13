@@ -11,11 +11,13 @@ using Microsoft.PackageGraph.ObjectModel;
 using Microsoft.PackageGraph.Storage;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Xml;
 using System.Xml.XPath;
 
@@ -23,20 +25,29 @@ namespace Microsoft.PackageGraph.Storage.Local
 {
     /// <summary>
     /// Client-facing SQLite read model. Every operation opens a short-lived SQLite
-    /// connection and materializes only the rows needed by the current SOAP request.
-    /// No package map, metadata graph, driver index or package object is retained.
+    /// connection and uses precomputed SQLite read models. A bounded metadata LRU
+    /// avoids repeatedly decompressing and parsing the same selected packages.
     /// </summary>
     internal sealed class SQLiteClientSyncMetadataStore : IClientSyncMetadataStore
     {
-        private const int RequiredSchemaVersion = 8;
+        private const int RequiredSchemaVersion = 9;
         private const int MaxObservedValuesPerType = 20000;
         private const int MaxObservedIdentifierLength = 2048;
+        private const int MetadataCacheCapacity = 1024;
+        private const long MetadataCacheMaxBytes = 256L * 1024L * 1024L;
         private const string CompressionNone = "none";
         private const string CompressionBrotli = "br";
         private const string CompressionGZip = "gzip";
 
         private readonly string DatabasePath;
         private readonly string ConnectionString;
+        private readonly object MetadataCacheLock = new();
+        private readonly Dictionary<int, LinkedListNode<MetadataCacheEntry>> MetadataCache = new();
+        private readonly LinkedList<MetadataCacheEntry> MetadataCacheLru = new();
+        private long MetadataCacheBytes;
+        private long MetadataCacheGeneration = -1;
+        private long MetadataCacheHits;
+        private long MetadataCacheMisses;
         private bool IsDisposed;
 
         public SQLiteClientSyncMetadataStore(string storePath)
@@ -237,6 +248,7 @@ WHERE identity = $identity
             }
 
             using var connection = OpenConnection();
+            EnsureMetadataCacheGeneration(connection);
             var bytes = ReadMetadataBytesByIdentity(connection, identity);
             return new MemoryStream(bytes, writable: false);
         }
@@ -250,6 +262,7 @@ WHERE identity = $identity
             }
 
             using var connection = OpenConnection();
+            EnsureMetadataCacheGeneration(connection);
             var packageIndex = GetPublishedPackageIndex(connection, identity);
             if (packageIndex < 0)
             {
@@ -301,68 +314,160 @@ WHERE identity = $identity
                 return Array.Empty<ClientSyncPackageRecord>();
             }
 
-            var installed = new HashSet<Guid>(
-                installedNonLeafUpdateIds ?? Array.Empty<Guid>());
-            var installedList = installed.ToList();
-            var excluded = new HashSet<Guid>(installed);
+            var totalStopwatch = Stopwatch.StartNew();
+            var queryStopwatch = Stopwatch.StartNew();
+            var excluded = new HashSet<Guid>(installedNonLeafUpdateIds ?? Array.Empty<Guid>());
             excluded.UnionWith(otherCachedUpdateIds ?? Array.Empty<Guid>());
-            var approved = new HashSet<MicrosoftUpdatePackageIdentity>(
-                approvedSoftwareUpdates ?? Array.Empty<MicrosoftUpdatePackageIdentity>());
-
-            var results = new List<ClientSyncPackageRecord>(maxResults + 1);
+            var selected = new List<(int PackageIndex, bool IsBundle, bool IsBundled)>(maxResults + 1);
             using var connection = OpenConnection();
+            EnsureMetadataCacheGeneration(connection);
+            PopulateTemporaryGuidTable(
+                connection,
+                "temp_client_sync_installed",
+                installedNonLeafUpdateIds ?? Array.Empty<Guid>());
+            PopulateTemporaryGuidTable(
+                connection,
+                "temp_client_sync_excluded",
+                excluded);
+            PopulateTemporaryTextTable(
+                connection,
+                "temp_client_sync_approved",
+                (approvedSoftwareUpdates ?? Array.Empty<MicrosoftUpdatePackageIdentity>())
+                    .Where(identity => identity != null)
+                    .Select(identity => identity.ToString()));
+
             using var command = connection.CreateCommand();
             command.CommandText = BuildSoftwareCandidateQuery(stage);
+            command.Parameters.AddWithValue("$driverType", (int)StoredPackageType.MicrosoftUpdateDriver);
+            command.Parameters.AddWithValue("$softwareType", (int)StoredPackageType.MicrosoftUpdateSoftware);
+            command.Parameters.AddWithValue("$approveAll", approveAllSoftwareUpdates ? 1 : 0);
+            command.Parameters.AddWithValue("$limit", maxResults + 1);
 
-            using var reader = command.ExecuteReader();
-            while (reader.Read())
+            using (var reader = command.ExecuteReader())
             {
-                if (!Guid.TryParse(reader.GetString(1), out var updateId)
-                    || excluded.Contains(updateId))
+                while (reader.Read())
                 {
-                    continue;
+                    selected.Add((
+                        reader.GetInt32(0),
+                        reader.GetInt64(1) != 0,
+                        reader.GetInt64(2) != 0));
                 }
+            }
+            queryStopwatch.Stop();
 
-                var package = MaterializePackage(
-                    (byte[])reader[4],
-                    reader.IsDBNull(5) ? CompressionNone : reader.GetString(5));
+            truncated = selected.Count > maxResults;
+            if (truncated)
+            {
+                selected.RemoveAt(selected.Count - 1);
+            }
+
+            var materializeStopwatch = Stopwatch.StartNew();
+            var results = new List<ClientSyncPackageRecord>(selected.Count);
+            foreach (var candidate in selected)
+            {
+                var package = LoadPackageByIndex(connection, candidate.PackageIndex);
                 if (package == null)
                 {
                     continue;
                 }
 
-                if (stage != ClientSyncSoftwareStage.Root
-                    && !package.IsApplicable(installedList))
-                {
-                    continue;
-                }
-
-                if (!approveAllSoftwareUpdates
-                    && package is SoftwareUpdate
-                    && !approved.Contains(package.Id))
-                {
-                    continue;
-                }
-
                 results.Add(new ClientSyncPackageRecord(
-                    reader.GetInt32(0),
+                    candidate.PackageIndex,
                     package,
-                    reader.GetInt64(6) != 0,
-                    reader.GetInt64(7) != 0));
-
-                if (results.Count > maxResults)
-                {
-                    break;
-                }
+                    candidate.IsBundle,
+                    candidate.IsBundled));
             }
+            materializeStopwatch.Stop();
+            totalStopwatch.Stop();
 
-            truncated = results.Count > maxResults;
-            if (truncated)
-            {
-                results.RemoveAt(results.Count - 1);
-            }
+            Trace.TraceInformation(
+                $"Client software scan stage={stage}: selected={selected.Count}, returned={results.Count}, " +
+                $"truncated={truncated}, sql_ms={queryStopwatch.ElapsedMilliseconds}, " +
+                $"materialize_ms={materializeStopwatch.ElapsedMilliseconds}, total_ms={totalStopwatch.ElapsedMilliseconds}, " +
+                $"cache_hits={Interlocked.Read(ref MetadataCacheHits)}, cache_misses={Interlocked.Read(ref MetadataCacheMisses)}.");
 
             return results;
+        }
+
+        public bool HasLaterSoftwareCandidates(
+            ClientSyncSoftwareStage currentStage,
+            IReadOnlyCollection<Guid> installedNonLeafUpdateIds,
+            IReadOnlyCollection<Guid> otherCachedUpdateIds,
+            bool approveAllSoftwareUpdates,
+            IReadOnlyCollection<MicrosoftUpdatePackageIdentity> approvedSoftwareUpdates)
+        {
+            ThrowIfDisposed();
+            if (currentStage == ClientSyncSoftwareStage.Leaf)
+            {
+                return false;
+            }
+
+            var excluded = new HashSet<Guid>(installedNonLeafUpdateIds ?? Array.Empty<Guid>());
+            excluded.UnionWith(otherCachedUpdateIds ?? Array.Empty<Guid>());
+
+            using var connection = OpenConnection();
+            PopulateTemporaryGuidTable(
+                connection,
+                "temp_client_sync_excluded",
+                excluded);
+            PopulateTemporaryTextTable(
+                connection,
+                "temp_client_sync_approved",
+                (approvedSoftwareUpdates ?? Array.Empty<MicrosoftUpdatePackageIdentity>())
+                    .Where(identity => identity != null)
+                    .Select(identity => identity.ToString()));
+
+            var laterStagePredicate = currentStage switch
+            {
+                ClientSyncSoftwareStage.Root => @"
+(
+    graph.package_type < $driverType
+    AND graph.has_prerequisites = 1
+    AND graph.has_dependents = 1
+)
+OR (
+    graph.package_type = $softwareType
+    AND graph.has_prerequisites = 1
+    AND graph.has_dependents = 0
+    AND graph.is_superseded = 0
+)",
+                ClientSyncSoftwareStage.NonLeaf => @"
+graph.package_type = $softwareType
+AND graph.has_prerequisites = 1
+AND graph.has_dependents = 0
+AND graph.is_superseded = 0",
+                ClientSyncSoftwareStage.BundledLeaf => @"
+graph.package_type = $softwareType
+AND graph.has_prerequisites = 1
+AND graph.has_dependents = 0
+AND graph.is_superseded = 0
+AND graph.is_bundled = 0",
+                _ => "0"
+            };
+
+            using var command = connection.CreateCommand();
+            command.CommandText = $@"
+SELECT 1
+FROM client_sync_graph AS graph
+JOIN packages AS package
+  ON package.package_index = graph.package_index
+ AND package.published = 1
+LEFT JOIN temp_client_sync_excluded AS excluded
+  ON excluded.value = graph.update_id
+LEFT JOIN temp_client_sync_approved AS approved
+  ON approved.value = package.identity
+WHERE excluded.value IS NULL
+  AND ({laterStagePredicate})
+  AND (
+      $approveAll = 1
+      OR graph.package_type <> $softwareType
+      OR approved.value IS NOT NULL
+  )
+LIMIT 1;";
+            command.Parameters.AddWithValue("$driverType", (int)StoredPackageType.MicrosoftUpdateDriver);
+            command.Parameters.AddWithValue("$softwareType", (int)StoredPackageType.MicrosoftUpdateSoftware);
+            command.Parameters.AddWithValue("$approveAll", approveAllSoftwareUpdates ? 1 : 0);
+            return command.ExecuteScalar() != null;
         }
 
         public DriverMatchResult MatchDriver(
@@ -374,14 +479,22 @@ WHERE identity = $identity
             var normalizedHardwareIds = (hardwareIds ?? Array.Empty<string>())
                 .Where(value => !string.IsNullOrWhiteSpace(value))
                 .Select(value => value.Trim().ToLowerInvariant())
+                .Distinct(StringComparer.Ordinal)
                 .ToList();
             var computerIds = (computerHardwareIds ?? Array.Empty<Guid>()).ToList();
-            var installed = (installedPrerequisites ?? Array.Empty<Guid>()).ToList();
+            var stopwatch = Stopwatch.StartNew();
+            var candidateCount = 0;
 
             using var connection = OpenConnection();
+            EnsureMetadataCacheGeneration(connection);
+            PopulateTemporaryGuidTable(
+                connection,
+                "temp_client_sync_installed",
+                installedPrerequisites ?? Array.Empty<Guid>());
             foreach (var hardwareId in normalizedHardwareIds)
             {
-                var candidates = ReadDriverCandidates(connection, hardwareId, installed);
+                var candidates = ReadDriverCandidates(connection, hardwareId);
+                candidateCount += candidates.Count;
                 if (candidates.Count == 0)
                 {
                     continue;
@@ -390,11 +503,31 @@ WHERE identity = $identity
                 var matched = MatchDriverCandidates(candidates, computerIds);
                 if (matched != null)
                 {
-                    matched.MatchedHardwareId = hardwareId;
-                    return matched;
+                    var driver = LoadPackageByIndex(connection, matched.Candidate.PackageIndex) as DriverUpdate;
+                    if (driver == null)
+                    {
+                        continue;
+                    }
+
+                    stopwatch.Stop();
+                    Trace.TraceInformation(
+                        $"Client driver match: hardware_ids={normalizedHardwareIds.Count}, " +
+                        $"candidates={candidateCount}, selected_package={matched.Candidate.PackageIndex}, " +
+                        $"total_ms={stopwatch.ElapsedMilliseconds}.");
+                    return new DriverMatchResult(driver)
+                    {
+                        MatchedHardwareId = hardwareId,
+                        MatchedVersion = matched.Candidate.Version,
+                        MatchedFeatureScore = matched.FeatureScore,
+                        MatchedComputerHardwareId = matched.ComputerHardwareId
+                    };
                 }
             }
 
+            stopwatch.Stop();
+            Trace.TraceInformation(
+                $"Client driver match: hardware_ids={normalizedHardwareIds.Count}, " +
+                $"candidates={candidateCount}, selected_package=none, total_ms={stopwatch.ElapsedMilliseconds}.");
             return null;
         }
 
@@ -515,6 +648,12 @@ LIMIT 1;";
 
         public void Dispose()
         {
+            lock (MetadataCacheLock)
+            {
+                MetadataCache.Clear();
+                MetadataCacheLru.Clear();
+                MetadataCacheBytes = 0;
+            }
             IsDisposed = true;
         }
 
@@ -524,29 +663,16 @@ LIMIT 1;";
             object value,
             bool parameterIsIdentity)
         {
+            EnsureMetadataCacheGeneration(connection);
             using var command = connection.CreateCommand();
             command.CommandText = $@"
 SELECT
     p.package_index,
-    p.metadata,
-    COALESCE(p.metadata_compression, 'none'),
-    EXISTS (
-        SELECT 1
-        FROM client_sync_bundles AS bundle
-        WHERE bundle.bundle_package_index = p.package_index
-    ) AS is_bundle,
-    EXISTS (
-        SELECT 1
-        FROM client_sync_packages AS target
-        JOIN client_sync_bundles AS bundle
-          ON bundle.bundled_update_id = target.update_id
-         AND bundle.bundled_revision_number = target.revision_number
-        JOIN packages AS source_package
-          ON source_package.package_index = bundle.bundle_package_index
-         AND source_package.published = 1
-        WHERE target.package_index = p.package_index
-    ) AS is_bundled
+    COALESCE(graph.is_bundle, 0),
+    COALESCE(graph.is_bundled, 0)
 FROM packages AS p
+LEFT JOIN client_sync_graph AS graph
+  ON graph.package_index = p.package_index
 WHERE {predicate}
   AND p.published = 1
 LIMIT 1;";
@@ -559,22 +685,29 @@ LIMIT 1;";
                 command.Parameters.AddWithValue("$value", Convert.ToInt32(value, CultureInfo.InvariantCulture));
             }
 
-            using var reader = command.ExecuteReader();
-            if (!reader.Read())
+            int packageIndex;
+            bool isBundle;
+            bool isBundled;
+            using (var reader = command.ExecuteReader())
             {
-                return null;
+                if (!reader.Read())
+                {
+                    return null;
+                }
+
+                packageIndex = reader.GetInt32(0);
+                isBundle = reader.GetInt64(1) != 0;
+                isBundled = reader.GetInt64(2) != 0;
             }
 
-            var materialized = MaterializePackage(
-                (byte[])reader[1],
-                reader.IsDBNull(2) ? CompressionNone : reader.GetString(2));
+            var materialized = LoadPackageByIndex(connection, packageIndex);
             return materialized == null
                 ? null
                 : new ClientSyncPackageRecord(
-                    reader.GetInt32(0),
+                    packageIndex,
                     materialized,
-                    reader.GetInt64(3) != 0,
-                    reader.GetInt64(4) != 0);
+                    isBundle,
+                    isBundled);
         }
 
         private static string BuildSoftwareCandidateQuery(ClientSyncSoftwareStage stage)
@@ -582,181 +715,177 @@ LIMIT 1;";
             var stagePredicate = stage switch
             {
                 ClientSyncSoftwareStage.Root => @"
-graph.has_prerequisites = 0
+graph.package_type < $driverType
+AND graph.has_prerequisites = 0
 AND graph.has_dependents = 1",
                 ClientSyncSoftwareStage.NonLeaf => @"
-graph.has_prerequisites = 1
+graph.package_type < $driverType
+AND graph.has_prerequisites = 1
 AND graph.has_dependents = 1",
-                ClientSyncSoftwareStage.BundledLeaf => $@"
-p.package_type = {(int)StoredPackageType.MicrosoftUpdateSoftware}
+                ClientSyncSoftwareStage.BundledLeaf => @"
+graph.package_type = $softwareType
 AND graph.has_prerequisites = 1
 AND graph.has_dependents = 0
-AND NOT EXISTS (
-    SELECT 1
-    FROM client_sync_supersedence AS supersedence
-    JOIN packages AS superseding_package
-      ON superseding_package.package_index = supersedence.superseding_package_index
-     AND superseding_package.published = 1
-    WHERE supersedence.superseded_update_id = current.update_id
-)
-AND EXISTS (
-    SELECT 1
-    FROM client_sync_bundles AS bundle
-    JOIN packages AS bundle_package
-      ON bundle_package.package_index = bundle.bundle_package_index
-     AND bundle_package.published = 1
-    WHERE bundle.bundled_update_id = current.update_id
-      AND bundle.bundled_revision_number = current.revision_number
-)",
-                ClientSyncSoftwareStage.Leaf => $@"
-p.package_type = {(int)StoredPackageType.MicrosoftUpdateSoftware}
+AND graph.is_superseded = 0
+AND graph.is_bundled = 1",
+                ClientSyncSoftwareStage.Leaf => @"
+graph.package_type = $softwareType
 AND graph.has_prerequisites = 1
 AND graph.has_dependents = 0
-AND NOT EXISTS (
-    SELECT 1
-    FROM client_sync_supersedence AS supersedence
-    JOIN packages AS superseding_package
-      ON superseding_package.package_index = supersedence.superseding_package_index
-     AND superseding_package.published = 1
-    WHERE supersedence.superseded_update_id = current.update_id
-)
-AND NOT EXISTS (
-    SELECT 1
-    FROM client_sync_bundles AS bundle
-    JOIN packages AS bundle_package
-      ON bundle_package.package_index = bundle.bundle_package_index
-     AND bundle_package.published = 1
-    WHERE bundle.bundled_update_id = current.update_id
-      AND bundle.bundled_revision_number = current.revision_number
-)",
+AND graph.is_superseded = 0
+AND graph.is_bundled = 0",
                 _ => throw new ArgumentOutOfRangeException(nameof(stage))
             };
 
-            // PrerequisitesGraph in the original implementation merged graph edges by
-            // UpdateID across every revision. Reproduce that behavior in SQL while
-            // materializing only the latest published revision for the response.
+            var applicabilityPredicate = stage == ClientSyncSoftwareStage.Root
+                ? string.Empty
+                : @"
+AND NOT EXISTS (
+    SELECT 1
+    FROM client_sync_prerequisites AS prerequisite
+    LEFT JOIN temp_client_sync_installed AS installed
+      ON installed.value = prerequisite.prerequisite_update_id
+    WHERE prerequisite.package_index = graph.package_index
+    GROUP BY prerequisite.group_ordinal
+    HAVING COUNT(installed.value) = 0
+)";
+
             return $@"
-WITH latest AS (
-    SELECT sync_package.update_id, MAX(sync_package.revision_number) AS revision_number
-    FROM client_sync_packages AS sync_package
-    JOIN packages AS published_package
-      ON published_package.package_index = sync_package.package_index
-     AND published_package.published = 1
-    GROUP BY sync_package.update_id
-),
-graph AS (
-    SELECT
-        latest.update_id,
-        EXISTS (
-            SELECT 1
-            FROM client_sync_packages AS own_revision
-            JOIN packages AS own_package
-              ON own_package.package_index = own_revision.package_index
-             AND own_package.published = 1
-            JOIN client_sync_prerequisites AS own_prerequisite
-              ON own_prerequisite.package_index = own_revision.package_index
-            WHERE own_revision.update_id = latest.update_id
-        ) AS has_prerequisites,
-        EXISTS (
-            SELECT 1
-            FROM client_sync_prerequisites AS dependent_prerequisite
-            JOIN packages AS dependent_package
-              ON dependent_package.package_index = dependent_prerequisite.package_index
-             AND dependent_package.published = 1
-            WHERE dependent_prerequisite.prerequisite_update_id = latest.update_id
-        ) AS has_dependents
-    FROM latest
-)
 SELECT
-    p.package_index,
-    current.update_id,
-    current.revision_number,
-    p.identity,
-    p.metadata,
-    COALESCE(p.metadata_compression, 'none'),
-    EXISTS (
-        SELECT 1
-        FROM client_sync_bundles AS source_bundle
-        WHERE source_bundle.bundle_package_index = p.package_index
-    ) AS is_bundle,
-    EXISTS (
-        SELECT 1
-        FROM client_sync_bundles AS containing_bundle
-        JOIN packages AS containing_package
-          ON containing_package.package_index = containing_bundle.bundle_package_index
-         AND containing_package.published = 1
-        WHERE containing_bundle.bundled_update_id = current.update_id
-          AND containing_bundle.bundled_revision_number = current.revision_number
-    ) AS is_bundled
-FROM client_sync_packages AS current
-JOIN latest
-  ON latest.update_id = current.update_id
- AND latest.revision_number = current.revision_number
-JOIN graph
-  ON graph.update_id = current.update_id
-JOIN packages AS p
-  ON p.package_index = current.package_index
- AND p.published = 1
-WHERE {stagePredicate}
-ORDER BY p.package_index;";
+    graph.package_index,
+    graph.is_bundle,
+    graph.is_bundled
+FROM client_sync_graph AS graph
+JOIN packages AS package
+  ON package.package_index = graph.package_index
+ AND package.published = 1
+LEFT JOIN temp_client_sync_excluded AS excluded
+  ON excluded.value = graph.update_id
+LEFT JOIN temp_client_sync_approved AS approved
+  ON approved.value = package.identity
+WHERE excluded.value IS NULL
+  AND {stagePredicate}
+  AND (
+      $approveAll = 1
+      OR graph.package_type <> $softwareType
+      OR approved.value IS NOT NULL
+  )
+  {applicabilityPredicate}
+ORDER BY graph.package_index
+LIMIT $limit;";
         }
 
-        private List<DriverCandidate> ReadDriverCandidates(
+        private List<DriverCandidateProjection> ReadDriverCandidates(
             SqliteConnection connection,
-            string hardwareId,
-            IReadOnlyCollection<Guid> installedPrerequisites)
+            string hardwareId)
         {
-            var rows = new List<(int PackageIndex, int MetadataOrdinal)>();
+            var results = new List<DriverCandidateProjection>();
             using (var command = connection.CreateCommand())
             {
                 command.CommandText = @"
-SELECT driver.package_index, driver.metadata_ordinal
+SELECT
+    driver.package_index,
+    driver.metadata_ordinal,
+    driver.driver_date_ticks,
+    driver.driver_version
 FROM client_sync_driver_hardware_ids AS driver
-JOIN packages AS package
-  ON package.package_index = driver.package_index
- AND package.published = 1
+JOIN client_sync_graph AS graph
+  ON graph.package_index = driver.package_index
+ AND graph.package_type = $driverType
 WHERE driver.hardware_id = $hardwareId
+  AND NOT EXISTS (
+      SELECT 1
+      FROM client_sync_prerequisites AS prerequisite
+      LEFT JOIN temp_client_sync_installed AS installed
+        ON installed.value = prerequisite.prerequisite_update_id
+      WHERE prerequisite.package_index = graph.package_index
+      GROUP BY prerequisite.group_ordinal
+      HAVING COUNT(installed.value) = 0
+  )
 ORDER BY driver.package_index, driver.metadata_ordinal;";
+                command.Parameters.AddWithValue("$driverType", (int)StoredPackageType.MicrosoftUpdateDriver);
                 command.Parameters.AddWithValue("$hardwareId", hardwareId);
                 using var reader = command.ExecuteReader();
                 while (reader.Read())
                 {
-                    rows.Add((reader.GetInt32(0), reader.GetInt32(1)));
+                    var versionText = reader.GetString(3);
+                    if (!ulong.TryParse(
+                            versionText,
+                            NumberStyles.None,
+                            CultureInfo.InvariantCulture,
+                            out var version))
+                    {
+                        version = 0;
+                    }
+
+                    results.Add(new DriverCandidateProjection(
+                        reader.GetInt32(0),
+                        reader.GetInt32(1),
+                        new DriverVersion
+                        {
+                            Date = new DateTime(reader.GetInt64(2), DateTimeKind.Unspecified),
+                            Version = version
+                        }));
                 }
             }
 
-            var installed = installedPrerequisites?.ToList() ?? new List<Guid>();
-            var packages = new Dictionary<int, DriverUpdate>();
-            var results = new List<DriverCandidate>();
-            foreach (var row in rows)
+            if (results.Count == 0)
             {
-                if (!packages.TryGetValue(row.PackageIndex, out var driver))
-                {
-                    driver = LoadPackageByIndex(connection, row.PackageIndex) as DriverUpdate;
-                    packages[row.PackageIndex] = driver;
-                }
+                return results;
+            }
 
-                if (driver == null || !driver.IsApplicable(installed))
-                {
-                    continue;
-                }
+            PopulateTemporaryDriverCandidateTable(connection, results);
+            var byKey = results.ToDictionary(
+                candidate => (candidate.PackageIndex, candidate.MetadataOrdinal));
 
-                var metadata = driver.GetDriverMetadata();
-                if (metadata == null
-                    || row.MetadataOrdinal < 0
-                    || row.MetadataOrdinal >= metadata.Count)
+            using (var computerCommand = connection.CreateCommand())
+            {
+                computerCommand.CommandText = @"
+SELECT computer.package_index, computer.metadata_ordinal, computer.computer_id
+FROM client_sync_driver_computer_ids AS computer
+JOIN temp_client_sync_driver_candidates AS candidate
+  ON candidate.package_index = computer.package_index
+ AND candidate.metadata_ordinal = computer.metadata_ordinal
+ORDER BY computer.package_index, computer.metadata_ordinal, computer.computer_id;";
+                using var reader = computerCommand.ExecuteReader();
+                while (reader.Read())
                 {
-                    continue;
+                    if (Guid.TryParse(reader.GetString(2), out var computerId)
+                        && byKey.TryGetValue((reader.GetInt32(0), reader.GetInt32(1)), out var candidate))
+                    {
+                        candidate.ComputerHardwareIds.Add(computerId);
+                    }
                 }
+            }
 
-                results.Add(new DriverCandidate(driver, metadata[row.MetadataOrdinal]));
+            using (var scoreCommand = connection.CreateCommand())
+            {
+                scoreCommand.CommandText = @"
+SELECT score.package_index, score.metadata_ordinal, score.operating_system, score.score
+FROM client_sync_driver_feature_scores AS score
+JOIN temp_client_sync_driver_candidates AS candidate
+  ON candidate.package_index = score.package_index
+ AND candidate.metadata_ordinal = score.metadata_ordinal
+ORDER BY score.package_index, score.metadata_ordinal, score.score, score.operating_system;";
+                using var reader = scoreCommand.ExecuteReader();
+                while (reader.Read())
+                {
+                    if (byKey.TryGetValue((reader.GetInt32(0), reader.GetInt32(1)), out var candidate))
+                    {
+                        candidate.FeatureScores.Add(new DriverFeatureScore
+                        {
+                            OperatingSystem = reader.GetString(2),
+                            Score = Convert.ToByte(reader.GetInt32(3), CultureInfo.InvariantCulture)
+                        });
+                    }
+                }
             }
 
             return results;
         }
 
-        private static DriverMatchResult MatchDriverCandidates(
-            IReadOnlyCollection<DriverCandidate> candidates,
+        private static DriverCandidateSelection MatchDriverCandidates(
+            IReadOnlyCollection<DriverCandidateProjection> candidates,
             IReadOnlyList<Guid> computerHardwareIds)
         {
             var withComputerTarget = candidates
@@ -774,57 +903,118 @@ ORDER BY driver.package_index, driver.metadata_ordinal;";
                 }
 
                 var matchesWithScores = computerMatches
-                    .Where(candidate => candidate.Metadata.FeatureScores != null
-                        && candidate.Metadata.FeatureScores.Count > 0)
+                    .Where(candidate => candidate.FeatureScores.Count > 0)
                     .ToList();
                 if (matchesWithScores.Count > 0)
                 {
                     var bestScore = matchesWithScores
-                        .SelectMany(candidate => candidate.Metadata.FeatureScores)
+                        .SelectMany(candidate => candidate.FeatureScores)
                         .OrderBy(score => score.Score)
                         .First();
                     var selected = matchesWithScores.First(candidate =>
-                        candidate.Metadata.FeatureScores.Any(score => score.Score == bestScore.Score));
-                    return new DriverMatchResult(selected.Driver)
-                    {
-                        MatchedVersion = selected.Metadata.Versioning,
-                        MatchedFeatureScore = bestScore,
-                        MatchedComputerHardwareId = computerHardwareId
-                    };
+                        candidate.FeatureScores.Any(score => score.Score == bestScore.Score));
+                    return new DriverCandidateSelection(
+                        selected,
+                        bestScore,
+                        computerHardwareId);
                 }
 
                 var versionSelected = computerMatches
-                    .OrderByDescending(candidate => candidate.Metadata.Versioning.Date)
-                    .ThenByDescending(candidate => candidate.Metadata.Versioning.Version)
+                    .OrderByDescending(candidate => candidate.Version.Date)
+                    .ThenByDescending(candidate => candidate.Version.Version)
                     .First();
-                return new DriverMatchResult(versionSelected.Driver)
-                {
-                    MatchedVersion = versionSelected.Metadata.Versioning,
-                    MatchedComputerHardwareId = computerHardwareId
-                };
+                return new DriverCandidateSelection(
+                    versionSelected,
+                    featureScore: null,
+                    computerHardwareId: computerHardwareId);
             }
 
-            var simpleCandidates = candidates
+            var simpleSelected = candidates
                 .Where(candidate => candidate.ComputerHardwareIds.Count == 0)
-                .OrderByDescending(candidate => candidate.Metadata.Versioning.Date)
-                .ThenByDescending(candidate => candidate.Metadata.Versioning.Version)
-                .ToList();
-            if (simpleCandidates.Count == 0)
+                .OrderByDescending(candidate => candidate.Version.Date)
+                .ThenByDescending(candidate => candidate.Version.Version)
+                .FirstOrDefault();
+            return simpleSelected == null
+                ? null
+                : new DriverCandidateSelection(
+                    simpleSelected,
+                    featureScore: null,
+                    computerHardwareId: null);
+        }
+
+        private static void PopulateTemporaryDriverCandidateTable(
+            SqliteConnection connection,
+            IReadOnlyCollection<DriverCandidateProjection> candidates)
+        {
+            using (var createCommand = connection.CreateCommand())
             {
-                return null;
+                createCommand.CommandText = @"
+CREATE TEMP TABLE IF NOT EXISTS temp_client_sync_driver_candidates (
+    package_index INTEGER NOT NULL,
+    metadata_ordinal INTEGER NOT NULL,
+    PRIMARY KEY(package_index, metadata_ordinal)
+) WITHOUT ROWID;
+DELETE FROM temp_client_sync_driver_candidates;";
+                createCommand.ExecuteNonQuery();
             }
 
-            var simpleSelected = simpleCandidates[0];
-            return new DriverMatchResult(simpleSelected.Driver)
+            using var transaction = connection.BeginTransaction();
+            using var insertCommand = connection.CreateCommand();
+            insertCommand.Transaction = transaction;
+            insertCommand.CommandText = @"
+INSERT OR IGNORE INTO temp_client_sync_driver_candidates(package_index, metadata_ordinal)
+VALUES ($packageIndex, $metadataOrdinal);";
+            var packageParameter = insertCommand.Parameters.Add("$packageIndex", SqliteType.Integer);
+            var ordinalParameter = insertCommand.Parameters.Add("$metadataOrdinal", SqliteType.Integer);
+            insertCommand.Prepare();
+            foreach (var candidate in candidates)
             {
-                MatchedVersion = simpleSelected.Metadata.Versioning
-            };
+                packageParameter.Value = candidate.PackageIndex;
+                ordinalParameter.Value = candidate.MetadataOrdinal;
+                insertCommand.ExecuteNonQuery();
+            }
+            transaction.Commit();
         }
 
         private MicrosoftUpdatePackage LoadPackageByIndex(
             SqliteConnection connection,
             int packageIndex)
         {
+            var entry = GetMetadataCacheEntry(connection, packageIndex);
+            if (entry == null)
+            {
+                return null;
+            }
+
+            lock (entry.SyncRoot)
+            {
+                if (!entry.PackageMaterialized)
+                {
+                    using var stream = new MemoryStream(entry.MetadataBytes, writable: false);
+                    entry.Package = MicrosoftUpdatePackage.FromStoredMetadataXml(stream, null);
+                    entry.PackageMaterialized = true;
+                }
+
+                return entry.Package;
+            }
+        }
+
+        private MetadataCacheEntry GetMetadataCacheEntry(
+            SqliteConnection connection,
+            int packageIndex)
+        {
+            lock (MetadataCacheLock)
+            {
+                if (MetadataCache.TryGetValue(packageIndex, out var cachedNode))
+                {
+                    MetadataCacheLru.Remove(cachedNode);
+                    MetadataCacheLru.AddFirst(cachedNode);
+                    Interlocked.Increment(ref MetadataCacheHits);
+                    return cachedNode.Value;
+                }
+            }
+
+            Interlocked.Increment(ref MetadataCacheMisses);
             using var command = connection.CreateCommand();
             command.CommandText = @"
 SELECT metadata, COALESCE(metadata_compression, 'none')
@@ -838,46 +1028,75 @@ WHERE package_index = $packageIndex
                 return null;
             }
 
-            return MaterializePackage(
+            var decompressStopwatch = Stopwatch.StartNew();
+            var bytes = DecompressBytes(
                 (byte[])reader[0],
                 reader.IsDBNull(1) ? CompressionNone : reader.GetString(1));
+            decompressStopwatch.Stop();
+            if (decompressStopwatch.ElapsedMilliseconds >= 100)
+            {
+                Trace.TraceInformation(
+                    $"Decompressed metadata package_index={packageIndex} in " +
+                    $"{decompressStopwatch.ElapsedMilliseconds} ms ({bytes?.Length ?? 0} bytes).");
+            }
+
+            var entry = new MetadataCacheEntry(packageIndex, bytes);
+            lock (MetadataCacheLock)
+            {
+                if (MetadataCache.TryGetValue(packageIndex, out var concurrentNode))
+                {
+                    MetadataCacheLru.Remove(concurrentNode);
+                    MetadataCacheLru.AddFirst(concurrentNode);
+                    return concurrentNode.Value;
+                }
+
+                var node = MetadataCacheLru.AddFirst(entry);
+                MetadataCache.Add(packageIndex, node);
+                MetadataCacheBytes += entry.MetadataBytes.LongLength;
+                while (MetadataCache.Count > MetadataCacheCapacity
+                    || MetadataCacheBytes > MetadataCacheMaxBytes)
+                {
+                    var last = MetadataCacheLru.Last;
+                    if (last == null)
+                    {
+                        break;
+                    }
+
+                    MetadataCache.Remove(last.Value.PackageIndex);
+                    MetadataCacheBytes -= last.Value.MetadataBytes.LongLength;
+                    MetadataCacheLru.RemoveLast();
+                }
+            }
+
+            return entry;
         }
 
-        private static MicrosoftUpdatePackage MaterializePackage(
-            byte[] metadata,
-            string compression)
+        private void EnsureMetadataCacheGeneration(SqliteConnection connection)
         {
-            if (metadata == null || metadata.Length == 0)
+            var generationText = ReadProperty(connection, "catalog_generation");
+            if (!long.TryParse(
+                    generationText,
+                    NumberStyles.Integer,
+                    CultureInfo.InvariantCulture,
+                    out var generation))
             {
-                return null;
+                generation = 0;
             }
 
-            var bytes = DecompressBytes(metadata, compression);
-            using var stream = new MemoryStream(bytes, writable: false);
-            return MicrosoftUpdatePackage.FromStoredMetadataXml(stream, null);
-        }
-
-        private static IReadOnlyList<Guid> GetEffectiveComputerHardwareIds(
-            DriverMetadata metadata)
-        {
-            var target = metadata.TargetComputerHardwareId ?? new List<Guid>();
-            var distribution = metadata.DistributionComputerHardwareId ?? new List<Guid>();
-            if (target.Count > 0 && distribution.Count > 0)
+            lock (MetadataCacheLock)
             {
-                return target.Intersect(distribution).ToList();
-            }
+                if (MetadataCacheGeneration == generation)
+                {
+                    return;
+                }
 
-            if (target.Count > 0)
-            {
-                return target;
+                MetadataCache.Clear();
+                MetadataCacheLru.Clear();
+                MetadataCacheBytes = 0;
+                MetadataCacheGeneration = generation;
+                Trace.TraceInformation(
+                    $"Client metadata cache reset for catalog generation {generation}.");
             }
-
-            if (distribution.Count > 0)
-            {
-                return distribution;
-            }
-
-            return Array.Empty<Guid>();
         }
 
         private int GetPublishedPackageIndex(
@@ -901,42 +1120,24 @@ WHERE identity = $identity
             SqliteConnection connection,
             MicrosoftUpdatePackageIdentity identity)
         {
-            using var command = connection.CreateCommand();
-            command.CommandText = @"
-SELECT metadata, COALESCE(metadata_compression, 'none')
-FROM packages
-WHERE identity = $identity
-  AND published = 1;";
-            command.Parameters.AddWithValue("$identity", identity.ToString());
-            using var reader = command.ExecuteReader();
-            if (!reader.Read())
+            var packageIndex = GetPublishedPackageIndex(connection, identity);
+            if (packageIndex < 0)
             {
                 throw new KeyNotFoundException($"Published package not found: {identity}");
             }
 
-            return DecompressBytes(
-                (byte[])reader[0],
-                reader.IsDBNull(1) ? CompressionNone : reader.GetString(1));
+            return ReadMetadataBytes(connection, packageIndex);
         }
 
         private byte[] ReadMetadataBytes(SqliteConnection connection, int packageIndex)
         {
-            using var command = connection.CreateCommand();
-            command.CommandText = @"
-SELECT metadata, COALESCE(metadata_compression, 'none')
-FROM packages
-WHERE package_index = $packageIndex
-  AND published = 1;";
-            command.Parameters.AddWithValue("$packageIndex", packageIndex);
-            using var reader = command.ExecuteReader();
-            if (!reader.Read())
+            var entry = GetMetadataCacheEntry(connection, packageIndex);
+            if (entry == null)
             {
                 throw new KeyNotFoundException($"Published package not found: {packageIndex}");
             }
 
-            return DecompressBytes(
-                (byte[])reader[0],
-                reader.IsDBNull(1) ? CompressionNone : reader.GetString(1));
+            return entry.MetadataBytes;
         }
 
         private static Dictionary<string, UpdateFileUrl> ReadPackageFileUrls(
@@ -1018,6 +1219,71 @@ WHERE published = 1
             }
 
             return result;
+        }
+
+        private static void PopulateTemporaryGuidTable(
+            SqliteConnection connection,
+            string tableName,
+            IEnumerable<Guid> values)
+        {
+            PopulateTemporaryTextTable(
+                connection,
+                tableName,
+                (values ?? Array.Empty<Guid>())
+                    .Where(value => value != Guid.Empty)
+                    .Distinct()
+                    .Select(value => value.ToString("D")));
+        }
+
+        private static void PopulateTemporaryTextTable(
+            SqliteConnection connection,
+            string tableName,
+            IEnumerable<string> values)
+        {
+            var allowedTableNames = new HashSet<string>(StringComparer.Ordinal)
+            {
+                "temp_client_sync_installed",
+                "temp_client_sync_excluded",
+                "temp_client_sync_approved"
+            };
+            if (!allowedTableNames.Contains(tableName))
+            {
+                throw new ArgumentOutOfRangeException(nameof(tableName));
+            }
+
+            using (var createCommand = connection.CreateCommand())
+            {
+                createCommand.CommandText = $@"
+CREATE TEMP TABLE IF NOT EXISTS {tableName} (
+    value TEXT PRIMARY KEY
+) WITHOUT ROWID;
+DELETE FROM {tableName};";
+                createCommand.ExecuteNonQuery();
+            }
+
+            var normalizedValues = (values ?? Array.Empty<string>())
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            if (normalizedValues.Count == 0)
+            {
+                return;
+            }
+
+            using var transaction = connection.BeginTransaction();
+            using var insertCommand = connection.CreateCommand();
+            insertCommand.Transaction = transaction;
+            insertCommand.CommandText = $@"
+INSERT OR IGNORE INTO {tableName}(value)
+VALUES ($value);";
+            var valueParameter = insertCommand.Parameters.Add("$value", SqliteType.Text);
+            insertCommand.Prepare();
+            foreach (var value in normalizedValues)
+            {
+                valueParameter.Value = value;
+                insertCommand.ExecuteNonQuery();
+            }
+            transaction.Commit();
         }
 
         private SqliteConnection OpenConnection()
@@ -1204,10 +1470,13 @@ WHERE type = 'table'
             {
                 "packages",
                 "client_sync_packages",
+                "client_sync_graph",
                 "client_sync_prerequisites",
                 "client_sync_supersedence",
                 "client_sync_bundles",
                 "client_sync_driver_hardware_ids",
+                "client_sync_driver_computer_ids",
+                "client_sync_driver_feature_scores",
                 "file_locations",
                 "package_file_map",
                 "observed_detectoids",
@@ -1263,17 +1532,54 @@ WHERE name = 'published';";
             }
         }
 
-        private sealed class DriverCandidate
+        private sealed class MetadataCacheEntry
         {
-            public DriverUpdate Driver { get; }
-            public DriverMetadata Metadata { get; }
-            public IReadOnlyList<Guid> ComputerHardwareIds { get; }
+            public int PackageIndex { get; }
+            public byte[] MetadataBytes { get; }
+            public object SyncRoot { get; } = new();
+            public bool PackageMaterialized { get; set; }
+            public MicrosoftUpdatePackage Package { get; set; }
 
-            public DriverCandidate(DriverUpdate driver, DriverMetadata metadata)
+            public MetadataCacheEntry(int packageIndex, byte[] metadataBytes)
             {
-                Driver = driver;
-                Metadata = metadata;
-                ComputerHardwareIds = GetEffectiveComputerHardwareIds(metadata);
+                PackageIndex = packageIndex;
+                MetadataBytes = metadataBytes ?? Array.Empty<byte>();
+            }
+        }
+
+        private sealed class DriverCandidateProjection
+        {
+            public int PackageIndex { get; }
+            public int MetadataOrdinal { get; }
+            public DriverVersion Version { get; }
+            public List<Guid> ComputerHardwareIds { get; } = new();
+            public List<DriverFeatureScore> FeatureScores { get; } = new();
+
+            public DriverCandidateProjection(
+                int packageIndex,
+                int metadataOrdinal,
+                DriverVersion version)
+            {
+                PackageIndex = packageIndex;
+                MetadataOrdinal = metadataOrdinal;
+                Version = version ?? new DriverVersion();
+            }
+        }
+
+        private sealed class DriverCandidateSelection
+        {
+            public DriverCandidateProjection Candidate { get; }
+            public DriverFeatureScore FeatureScore { get; }
+            public Guid? ComputerHardwareId { get; }
+
+            public DriverCandidateSelection(
+                DriverCandidateProjection candidate,
+                DriverFeatureScore featureScore,
+                Guid? computerHardwareId)
+            {
+                Candidate = candidate ?? throw new ArgumentNullException(nameof(candidate));
+                FeatureScore = featureScore;
+                ComputerHardwareId = computerHardwareId;
             }
         }
     }
