@@ -62,6 +62,11 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
         int FirstX { get; }
     }
 
+    public interface IUpstreamTimeoutOptions
+    {
+        int UpstreamTimeoutMinutes { get; }
+    }
+
     public interface ISyncQueryFilter
     {
         IEnumerable<string> ProductsFilter { get; }
@@ -70,10 +75,13 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
     }
 
     [Verb("fetch-config", HelpText = "Retrieves upstream server configuration")]
-    public class FetchConfigurationOptions
+    public class FetchConfigurationOptions : IUpstreamTimeoutOptions
     {
         [Option("endpoint", Required = false, HelpText = "The endpoint from which to fetch updates", SetName = "custom")]
         public string UpstreamEndpoint { get; set; }
+
+        [Option("upstream-timeout-minutes", Required = false, Default = 3, HelpText = "SOAP timeout in minutes for requests to the upstream update server. Must be greater than zero.")]
+        public int UpstreamTimeoutMinutes { get; set; }
 
         [Option("master", Required = false, Default = false, HelpText = "Only fetch categories", SetName = "official")]
         public bool MasterEndpoint { get; set; }
@@ -83,10 +91,13 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
     }
 
     [Verb("pre-fetch", HelpText = "Retrieves metadata from an upstream server")]
-    public class FetchCategoriesOptions : IMetadataStoreOptions
+    public class FetchCategoriesOptions : IMetadataStoreOptions, IUpstreamTimeoutOptions
     {
         [Option("endpoint", Required = false, HelpText = "The endpoint from which to fetch categories.", SetName = "custom")]
         public string UpstreamEndpoint { get; set; }
+
+        [Option("upstream-timeout-minutes", Required = false, Default = 3, HelpText = "SOAP timeout in minutes for requests to the upstream update server. Must be greater than zero.")]
+        public int UpstreamTimeoutMinutes { get; set; }
 
         [Option("master", Required = false, Default = false, HelpText = "Fetch categories from the official Microsoft upstream server.", SetName = "official")]
         public bool MasterEndpoint { get; set; }
@@ -152,7 +163,7 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
     }
 
     [Verb("fetch", HelpText = "Retrieves metadata from an upstream server")]
-    public class FetchPackagesOptions : IMetadataStoreOptions, IMetadataSourceOptions, IIncrementalSyncOptions
+    public class FetchPackagesOptions : IMetadataStoreOptions, IMetadataSourceOptions, IIncrementalSyncOptions, IUpstreamTimeoutOptions
     {
         public const string MicrosoftUpdateEndpoint = "microsoft-update";
         public const string NuGetV3Endpoint = "nuget";
@@ -176,6 +187,9 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
 
         [Option("endpoint-type", Required = false, Default = MicrosoftUpdateEndpoint, HelpText = "The endpoint from which to fetch updates.")]
         public string EndpointType { get; set; }
+
+        [Option("upstream-timeout-minutes", Required = false, Default = 3, HelpText = "SOAP timeout in minutes for requests to the upstream update server. Must be greater than zero.")]
+        public int UpstreamTimeoutMinutes { get; set; }
 
         [Option("product-filter", Required = false, Separator = '+', HelpText = "Product filter for sync'ing updates. Strongly recommended; without it Microsoft Update may return a very large catalog.")]
         public IEnumerable<string> ProductsFilter { get; set; }
@@ -215,7 +229,7 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
     }
 
     [Verb("fetch-observed", HelpText = "Fetches product updates and drivers observed during Windows Update client scans")]
-    public class FetchObservedOptions : IMetadataStoreOptions, IMetadataSourceOptions, IIncrementalSyncOptions
+    public class FetchObservedOptions : IMetadataStoreOptions, IMetadataSourceOptions, IIncrementalSyncOptions, IUpstreamTimeoutOptions
     {
         [Option("store-alias", Required = false, HelpText = "Destination store alias")]
         public string Alias { get; set; }
@@ -234,6 +248,9 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
 
         [Option("endpoint-type", Required = false, Default = FetchPackagesOptions.MicrosoftUpdateEndpoint, HelpText = "Upstream endpoint type; only microsoft-update is supported")]
         public string EndpointType { get; set; }
+
+        [Option("upstream-timeout-minutes", Required = false, Default = 3, HelpText = "SOAP timeout in minutes for requests to the upstream update server. Must be greater than zero.")]
+        public int UpstreamTimeoutMinutes { get; set; }
 
         [Option("classification-filter", Required = false, Separator = '+', HelpText = "Classification GUIDs to fetch for each observed product; required unless --skip-products is used")]
         public IEnumerable<string> ClassificationsFilter { get; set; }

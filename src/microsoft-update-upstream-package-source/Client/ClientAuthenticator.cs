@@ -23,6 +23,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
     /// </example>
     class ClientAuthenticator
     {
+        private readonly TimeSpan RequestTimeout;
         /// <summary>
         /// Gets the update server endpoint this instance of ClientAuthenticator authenticates with.
         /// </summary>
@@ -33,10 +34,8 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// </summary>
         /// <param name="endpoint">The endpoint to authenticate with.</param>
         public ClientAuthenticator(Endpoint endpoint)
+            : this(endpoint, new Guid().ToString(), new Guid(), UpstreamServerClient.DefaultRequestTimeout)
         {
-            UpstreamEndpoint = endpoint;
-            AccountGuid = new Guid();
-            AccountName = new Guid().ToString();
         }
 
         /// <summary>
@@ -44,10 +43,8 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// Microsoft upstream update server.
         /// </summary>
         public ClientAuthenticator()
+            : this(Endpoint.Default, new Guid().ToString(), new Guid(), UpstreamServerClient.DefaultRequestTimeout)
         {
-            UpstreamEndpoint = Endpoint.Default;
-            AccountGuid = new Guid();
-            AccountName = new Guid().ToString();
         }
 
         /// <summary>
@@ -68,10 +65,21 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// <param name="accountName">Account name.</param>
         /// <param name="accountGuid">Account GUID.</param>
         public ClientAuthenticator(Endpoint endpoint, string accountName, Guid accountGuid)
+            : this(endpoint, accountName, accountGuid, UpstreamServerClient.DefaultRequestTimeout)
         {
+        }
+
+        public ClientAuthenticator(Endpoint endpoint, string accountName, Guid accountGuid, TimeSpan requestTimeout)
+        {
+            if (requestTimeout <= TimeSpan.Zero)
+            {
+                throw new ArgumentOutOfRangeException(nameof(requestTimeout), "The upstream request timeout must be greater than zero.");
+            }
+
             UpstreamEndpoint = endpoint;
             AccountGuid = accountGuid;
-            
+            RequestTimeout = requestTimeout;
+
             if (!string.IsNullOrEmpty(accountName))
             {
                 AccountName = accountName;
@@ -80,6 +88,17 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
             {
                 AccountName = new Guid().ToString();
             }
+        }
+
+        private System.ServiceModel.BasicHttpBinding CreateHttpBinding()
+        {
+            return new System.ServiceModel.BasicHttpBinding()
+            {
+                OpenTimeout = RequestTimeout,
+                CloseTimeout = RequestTimeout,
+                ReceiveTimeout = RequestTimeout,
+                SendTimeout = RequestTimeout
+            };
         }
 
         /// <summary>
@@ -159,12 +178,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         {
             GetAuthConfigResponse authConfigResponse;
 
-            var httpBinding = new System.ServiceModel.BasicHttpBinding()
-            {
-                ReceiveTimeout = new TimeSpan(0, 3, 0),
-                SendTimeout = new TimeSpan(0, 3, 0),
-                OpenTimeout = new TimeSpan(0, 3, 0)
-            };
+            var httpBinding = CreateHttpBinding();
             var upstreamEndpoint = new System.ServiceModel.EndpointAddress(UpstreamEndpoint.ServerSyncURI);
             if (upstreamEndpoint.Uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
             {
@@ -195,7 +209,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// <returns>An authentication cookie</returns>
         private async Task<UpdateServices.WebServices.DssAuthentication.AuthorizationCookie> GetAuthorizationCookie(AuthPlugInInfo authInfo)
         {
-            var httpBinding = new System.ServiceModel.BasicHttpBinding();
+            var httpBinding = CreateHttpBinding();
             var upstreamEndpoint = new System.ServiceModel.EndpointAddress(UpstreamEndpoint.GetAuthenticationEndpointFromRelativeUrl(authInfo.ServiceUrl));
 
             if (upstreamEndpoint.Uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
@@ -234,7 +248,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// <returns>An access cookie</returns>
         private async Task<Cookie> GetServerAccessCookie(UpdateServices.WebServices.DssAuthentication.AuthorizationCookie authCookie)
         {
-            var httpBinding = new System.ServiceModel.BasicHttpBinding();
+            var httpBinding = CreateHttpBinding();
             var upstreamEndpoint = new System.ServiceModel.EndpointAddress(UpstreamEndpoint.ServerSyncURI);
             if (upstreamEndpoint.Uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
             {

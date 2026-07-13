@@ -23,6 +23,26 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
     /// </summary>
     public class UpstreamServerClient
     {
+        private static TimeSpan _DefaultRequestTimeout = TimeSpan.FromMinutes(3);
+
+        /// <summary>
+        /// Default timeout used for upstream SOAP requests when no explicit timeout is supplied.
+        /// </summary>
+        public static TimeSpan DefaultRequestTimeout
+        {
+            get => _DefaultRequestTimeout;
+            set
+            {
+                if (value <= TimeSpan.Zero)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(value), "The upstream request timeout must be greater than zero.");
+                }
+
+                _DefaultRequestTimeout = value;
+            }
+        }
+
+        private readonly TimeSpan RequestTimeout;
         /// <summary>
         /// Gets the update server <see cref="Endpoint"/> this client connects to.
         /// </summary>
@@ -58,13 +78,31 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// </summary>
         /// <param name="upstreamEndpoint">The server endpoint this client will connect to.</param>
         public UpstreamServerClient(Endpoint upstreamEndpoint)
+            : this(upstreamEndpoint, DefaultRequestTimeout)
         {
+        }
+
+        /// <summary>
+        /// Initializes a new instance of UpstreamServerClient with an explicit SOAP timeout.
+        /// </summary>
+        /// <param name="upstreamEndpoint">The server endpoint this client will connect to.</param>
+        /// <param name="requestTimeout">Timeout applied to open, close, send and receive operations.</param>
+        public UpstreamServerClient(Endpoint upstreamEndpoint, TimeSpan requestTimeout)
+        {
+            if (requestTimeout <= TimeSpan.Zero)
+            {
+                throw new ArgumentOutOfRangeException(nameof(requestTimeout), "The upstream request timeout must be greater than zero.");
+            }
+
             UpstreamEndpoint = upstreamEndpoint;
+            RequestTimeout = requestTimeout;
 
             var httpBindingWithTimeout = new System.ServiceModel.BasicHttpBinding()
             {
-                ReceiveTimeout = new TimeSpan(0, 3, 0),
-                SendTimeout = new TimeSpan(0, 3, 0),
+                OpenTimeout = RequestTimeout,
+                CloseTimeout = RequestTimeout,
+                ReceiveTimeout = RequestTimeout,
+                SendTimeout = RequestTimeout,
                 MaxBufferSize = int.MaxValue,
                 ReaderQuotas = System.Xml.XmlDictionaryReaderQuotas.Max,
                 MaxReceivedMessageSize = int.MaxValue,
@@ -88,7 +126,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
             };
             MetadataQueryProgress?.Invoke(this, progress);
 
-            var authenticator = new ClientAuthenticator(UpstreamEndpoint, accountName, accountGuid ?? new Guid());
+            var authenticator = new ClientAuthenticator(UpstreamEndpoint, accountName, accountGuid ?? new Guid(), RequestTimeout);
             AccessToken = await authenticator.Authenticate(AccessToken);
 
             progress.CurrentTask = MetadataQueryStage.AuthenticateEnd;

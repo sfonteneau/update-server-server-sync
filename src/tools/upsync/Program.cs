@@ -45,6 +45,23 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
 
         private static void RunCommand(object options)
         {
+            if (options is IUpstreamTimeoutOptions upstreamTimeoutOptions)
+            {
+                if (upstreamTimeoutOptions.UpstreamTimeoutMinutes <= 0)
+                {
+                    throw new ArgumentOutOfRangeException(
+                        nameof(upstreamTimeoutOptions.UpstreamTimeoutMinutes),
+                        upstreamTimeoutOptions.UpstreamTimeoutMinutes,
+                        "--upstream-timeout-minutes must be greater than zero.");
+                }
+
+                UpstreamServerClient.DefaultRequestTimeout =
+                    TimeSpan.FromMinutes(upstreamTimeoutOptions.UpstreamTimeoutMinutes);
+
+                Console.WriteLine(
+                    $"Upstream SOAP timeout: {upstreamTimeoutOptions.UpstreamTimeoutMinutes} minute(s).");
+            }
+
             switch (options)
             {
                 case FetchPackagesOptions value:
