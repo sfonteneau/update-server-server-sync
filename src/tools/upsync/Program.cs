@@ -4,6 +4,7 @@
 using System;
 using CommandLine;
 using Microsoft.PackageGraph.MicrosoftUpdate;
+using Microsoft.PackageGraph.MicrosoftUpdate.Source;
 using Microsoft.PackageGraph.Storage;
 
 namespace Microsoft.PackageGraph.Utilitites.Upsync
