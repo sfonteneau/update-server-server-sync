@@ -35,6 +35,7 @@ namespace Microsoft.PackageGraph.Storage.Local
         private const int MaxObservedIdentifierLength = 2048;
         private const int MetadataCacheCapacity = 1024;
         private const long MetadataCacheMaxBytes = 256L * 1024L * 1024L;
+        private const string ClientSyncGraphAlgorithmVersion = "direct-sqlite-graph-v2";
         private const string CompressionNone = "none";
         private const string CompressionBrotli = "br";
         private const string CompressionGZip = "gzip";
@@ -72,7 +73,186 @@ namespace Microsoft.PackageGraph.Storage.Local
 
             using var connection = OpenConnection();
             ValidateSchema(connection);
+            EnsureClientSyncGraph(connection);
             TracePublishedCatalogSummary(connection);
+        }
+
+        private static void EnsureClientSyncGraph(SqliteConnection connection)
+        {
+            var storedVersion = ReadProperty(connection, "client_sync_graph_algorithm_version");
+            using var checkCommand = connection.CreateCommand();
+            checkCommand.CommandText = @"
+WITH expected AS (
+    SELECT sync_package.package_index
+    FROM client_sync_packages AS sync_package
+    JOIN packages AS package
+      ON package.package_index = sync_package.package_index
+     AND package.published = 1
+    JOIN (
+        SELECT sync_package.update_id, MAX(sync_package.revision_number) AS revision_number
+        FROM client_sync_packages AS sync_package
+        JOIN packages AS package
+          ON package.package_index = sync_package.package_index
+         AND package.published = 1
+        GROUP BY sync_package.update_id
+    ) AS latest
+      ON latest.update_id = sync_package.update_id
+     AND latest.revision_number = sync_package.revision_number
+),
+difference AS (
+    SELECT package_index
+    FROM (
+        SELECT package_index FROM expected
+        EXCEPT
+        SELECT package_index FROM client_sync_graph
+    )
+
+    UNION ALL
+
+    SELECT package_index
+    FROM (
+        SELECT package_index FROM client_sync_graph
+        EXCEPT
+        SELECT package_index FROM expected
+    )
+)
+SELECT EXISTS(SELECT 1 FROM difference LIMIT 1);";
+            var graphDiffers = Convert.ToInt32(
+                checkCommand.ExecuteScalar(),
+                CultureInfo.InvariantCulture) != 0;
+            if (!graphDiffers
+                && string.Equals(
+                    storedVersion,
+                    ClientSyncGraphAlgorithmVersion,
+                    StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            var repairedAt = DateTimeOffset.UtcNow;
+            using var transaction = connection.BeginTransaction();
+            using (var deleteCommand = connection.CreateCommand())
+            {
+                deleteCommand.Transaction = transaction;
+                deleteCommand.CommandText = "DELETE FROM client_sync_graph;";
+                deleteCommand.ExecuteNonQuery();
+            }
+
+            using (var insertCommand = connection.CreateCommand())
+            {
+                insertCommand.Transaction = transaction;
+                insertCommand.CommandText = @"
+WITH latest AS (
+    SELECT sync_package.update_id, MAX(sync_package.revision_number) AS revision_number
+    FROM client_sync_packages AS sync_package
+    JOIN packages AS package
+      ON package.package_index = sync_package.package_index
+     AND package.published = 1
+    GROUP BY sync_package.update_id
+),
+prerequisite_updates AS (
+    SELECT DISTINCT sync_package.update_id
+    FROM client_sync_packages AS sync_package
+    JOIN packages AS package
+      ON package.package_index = sync_package.package_index
+     AND package.published = 1
+    JOIN client_sync_prerequisites AS prerequisite
+      ON prerequisite.package_index = sync_package.package_index
+),
+dependent_updates AS (
+    SELECT DISTINCT prerequisite.prerequisite_update_id AS update_id
+    FROM client_sync_prerequisites AS prerequisite
+    JOIN packages AS package
+      ON package.package_index = prerequisite.package_index
+     AND package.published = 1
+),
+bundle_packages AS (
+    SELECT DISTINCT bundle.bundle_package_index AS package_index
+    FROM client_sync_bundles AS bundle
+    JOIN packages AS package
+      ON package.package_index = bundle.bundle_package_index
+     AND package.published = 1
+),
+bundled_updates AS (
+    SELECT DISTINCT bundle.bundled_update_id, bundle.bundled_revision_number
+    FROM client_sync_bundles AS bundle
+    JOIN packages AS package
+      ON package.package_index = bundle.bundle_package_index
+     AND package.published = 1
+),
+superseded_updates AS (
+    SELECT DISTINCT supersedence.superseded_update_id AS update_id
+    FROM client_sync_supersedence AS supersedence
+    JOIN packages AS package
+      ON package.package_index = supersedence.superseding_package_index
+     AND package.published = 1
+)
+INSERT INTO client_sync_graph(
+    package_index,
+    update_id,
+    revision_number,
+    package_type,
+    has_prerequisites,
+    has_dependents,
+    is_bundle,
+    is_bundled,
+    is_superseded)
+SELECT
+    package.package_index,
+    sync_package.update_id,
+    sync_package.revision_number,
+    package.package_type,
+    CASE WHEN prerequisite_updates.update_id IS NULL THEN 0 ELSE 1 END,
+    CASE WHEN dependent_updates.update_id IS NULL THEN 0 ELSE 1 END,
+    CASE WHEN bundle_packages.package_index IS NULL THEN 0 ELSE 1 END,
+    CASE WHEN bundled_updates.bundled_update_id IS NULL THEN 0 ELSE 1 END,
+    CASE WHEN superseded_updates.update_id IS NULL THEN 0 ELSE 1 END
+FROM latest
+JOIN client_sync_packages AS sync_package
+  ON sync_package.update_id = latest.update_id
+ AND sync_package.revision_number = latest.revision_number
+JOIN packages AS package
+  ON package.package_index = sync_package.package_index
+ AND package.published = 1
+LEFT JOIN prerequisite_updates
+  ON prerequisite_updates.update_id = sync_package.update_id
+LEFT JOIN dependent_updates
+  ON dependent_updates.update_id = sync_package.update_id
+LEFT JOIN bundle_packages
+  ON bundle_packages.package_index = package.package_index
+LEFT JOIN bundled_updates
+  ON bundled_updates.bundled_update_id = sync_package.update_id
+ AND bundled_updates.bundled_revision_number = sync_package.revision_number
+LEFT JOIN superseded_updates
+  ON superseded_updates.update_id = sync_package.update_id;";
+                insertCommand.ExecuteNonQuery();
+            }
+
+            using (var stateCommand = connection.CreateCommand())
+            {
+                stateCommand.Transaction = transaction;
+                stateCommand.CommandText = @"
+INSERT INTO store_properties(key, value)
+VALUES
+    ('client_sync_graph_algorithm_version', $version),
+    ('catalog_last_changed', $changedAt)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+
+INSERT INTO store_properties(key, value)
+VALUES ('catalog_generation', '1')
+ON CONFLICT(key) DO UPDATE SET
+    value = CAST(CAST(store_properties.value AS INTEGER) + 1 AS TEXT);";
+                stateCommand.Parameters.AddWithValue("$version", ClientSyncGraphAlgorithmVersion);
+                stateCommand.Parameters.AddWithValue(
+                    "$changedAt",
+                    repairedAt.ToString("O", CultureInfo.InvariantCulture));
+                stateCommand.ExecuteNonQuery();
+            }
+
+            transaction.Commit();
+            Trace.TraceWarning(
+                $"Rebuilt the published client-sync graph at server startup " +
+                $"(previous_version={storedVersion ?? "missing"}, row_difference={graphDiffers}).");
         }
 
         private static void TracePublishedCatalogSummary(SqliteConnection connection)
@@ -82,14 +262,16 @@ namespace Microsoft.PackageGraph.Storage.Local
 SELECT
     (SELECT COUNT(*) FROM packages WHERE published = 1),
     (SELECT COUNT(*) FROM client_sync_graph),
-    (SELECT COUNT(*)
-       FROM client_sync_graph
-      WHERE package_type = $softwareType),
-    (SELECT COUNT(*)
-       FROM client_sync_graph
-      WHERE package_type = $driverType),
+    (SELECT COUNT(*) FROM client_sync_graph WHERE package_type = $detectoidType),
+    (SELECT COUNT(*) FROM client_sync_graph WHERE package_type = $productType),
+    (SELECT COUNT(*) FROM client_sync_graph WHERE package_type = $softwareType),
+    (SELECT COUNT(*) FROM client_sync_graph WHERE package_type = $driverType),
+    (SELECT COUNT(*) FROM client_sync_graph WHERE package_type < $driverType AND has_prerequisites = 0),
+    (SELECT COUNT(*) FROM client_sync_graph WHERE package_type = $softwareType AND is_superseded = 0),
     (SELECT COUNT(*) FROM client_sync_driver_hardware_ids AS driver
        JOIN client_sync_graph AS graph ON graph.package_index = driver.package_index);";
+            command.Parameters.AddWithValue("$detectoidType", (int)StoredPackageType.MicrosoftUpdateDetectoid);
+            command.Parameters.AddWithValue("$productType", (int)StoredPackageType.MicrosoftUpdateProduct);
             command.Parameters.AddWithValue("$softwareType", (int)StoredPackageType.MicrosoftUpdateSoftware);
             command.Parameters.AddWithValue("$driverType", (int)StoredPackageType.MicrosoftUpdateDriver);
             using var reader = command.ExecuteReader();
@@ -100,8 +282,10 @@ SELECT
 
             Trace.TraceInformation(
                 $"Published SQLite catalog: packages={reader.GetInt64(0)}, graph={reader.GetInt64(1)}, " +
-                $"software={reader.GetInt64(2)}, drivers={reader.GetInt64(3)}, " +
-                $"driver_hardware_rows={reader.GetInt64(4)}.");
+                $"detectoids={reader.GetInt64(2)}, products={reader.GetInt64(3)}, " +
+                $"software={reader.GetInt64(4)}, drivers={reader.GetInt64(5)}, " +
+                $"roots={reader.GetInt64(6)}, active_software={reader.GetInt64(7)}, " +
+                $"driver_hardware_rows={reader.GetInt64(8)}.");
         }
 
         public MetadataStoreGenerationInfo GetPublishedCatalogInfo()
@@ -1226,7 +1410,7 @@ SELECT package_index, identity
 FROM packages
 WHERE published = 1
   {(observedDetectorsOnly
-      ? "AND package_type IN ($detectoidType, $productType)"
+      ? "AND package_type = $detectoidType"
       : string.Empty)}
   AND package_index IN ({string.Join(", ", parameterNames)});";
                 if (observedDetectorsOnly)
@@ -1234,9 +1418,6 @@ WHERE published = 1
                     command.Parameters.AddWithValue(
                         "$detectoidType",
                         (int)StoredPackageType.MicrosoftUpdateDetectoid);
-                    command.Parameters.AddWithValue(
-                        "$productType",
-                        (int)StoredPackageType.MicrosoftUpdateProduct);
                 }
 
                 using var reader = command.ExecuteReader();

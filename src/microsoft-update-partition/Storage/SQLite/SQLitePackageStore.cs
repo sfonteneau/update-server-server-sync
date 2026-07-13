@@ -48,6 +48,7 @@ namespace Microsoft.PackageGraph.Storage.Local
         private const int MaxObservedIdentifierLength = 2048;
         private const string CatalogPublicationDeferredKey = "catalog_publication_deferred";
         private const string CatalogUnpublishedChangesKey = "catalog_unpublished_changes";
+        private const string ClientSyncGraphAlgorithmVersion = "direct-sqlite-graph-v2";
 
         private readonly string TargetPath;
         private readonly string DatabasePath;
@@ -922,6 +923,15 @@ LEFT JOIN superseded_updates
   ON superseded_updates.update_id = sync_package.update_id;";
             insertCommand.ExecuteNonQuery();
 
+            using var versionCommand = Connection.CreateCommand();
+            versionCommand.Transaction = transaction;
+            versionCommand.CommandText = @"
+INSERT INTO store_properties(key, value)
+VALUES ('client_sync_graph_algorithm_version', $version)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
+            versionCommand.Parameters.AddWithValue("$version", ClientSyncGraphAlgorithmVersion);
+            versionCommand.ExecuteNonQuery();
+
         }
 
         private void PersistUnpublishedCatalogChanges()
@@ -1189,7 +1199,8 @@ ORDER BY last_seen DESC, computer_id;";
 
         public void ReplaceDetectoidProductMappings(
             IEnumerable<DetectoidProductMapping> mappings,
-            DateTimeOffset rebuiltAt)
+            DateTimeOffset rebuiltAt,
+            string algorithmVersion)
         {
             var normalizedMappings = (mappings ?? Array.Empty<DetectoidProductMapping>())
                 .Where(mapping => mapping != null
@@ -1215,11 +1226,34 @@ ORDER BY last_seen DESC, computer_id;";
                 ? DateTimeOffset.UtcNow
                 : rebuiltAt.ToUniversalTime();
             var rebuiltAtText = normalizedRebuiltAt.ToString("O", CultureInfo.InvariantCulture);
+            var normalizedAlgorithmVersion = string.IsNullOrWhiteSpace(algorithmVersion)
+                ? "unknown"
+                : algorithmVersion.Trim();
 
             StateLock.EnterWriteLock();
             try
             {
                 using var transaction = Connection.BeginTransaction();
+
+                using (var cleanupCommand = Connection.CreateCommand())
+                {
+                    cleanupCommand.Transaction = transaction;
+                    cleanupCommand.CommandText = @"
+DELETE FROM observed_detectoids
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM client_sync_packages AS sync_package
+    INNER JOIN packages AS package
+        ON package.package_index = sync_package.package_index
+    WHERE sync_package.update_id = observed_detectoids.update_id
+      AND package.package_type = $detectoidType
+      AND package.published = 1
+);";
+                    cleanupCommand.Parameters.AddWithValue(
+                        "$detectoidType",
+                        (int)Microsoft.PackageGraph.MicrosoftUpdate.StoredPackageType.MicrosoftUpdateDetectoid);
+                    cleanupCommand.ExecuteNonQuery();
+                }
 
                 using (var deleteCommand = Connection.CreateCommand())
                 {
@@ -1252,15 +1286,26 @@ VALUES ($detectoidUpdateId, $productCategoryId, $sourceFlags);";
                     }
                 }
 
-                using (var stateCommand = Connection.CreateCommand())
+                using (var rebuiltAtCommand = Connection.CreateCommand())
                 {
-                    stateCommand.Transaction = transaction;
-                    stateCommand.CommandText = @"
+                    rebuiltAtCommand.Transaction = transaction;
+                    rebuiltAtCommand.CommandText = @"
 INSERT INTO store_properties(key, value)
 VALUES ('detectoid_product_map_rebuilt_at', $rebuiltAt)
 ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
-                    stateCommand.Parameters.AddWithValue("$rebuiltAt", rebuiltAtText);
-                    stateCommand.ExecuteNonQuery();
+                    rebuiltAtCommand.Parameters.AddWithValue("$rebuiltAt", rebuiltAtText);
+                    rebuiltAtCommand.ExecuteNonQuery();
+                }
+
+                using (var versionCommand = Connection.CreateCommand())
+                {
+                    versionCommand.Transaction = transaction;
+                    versionCommand.CommandText = @"
+INSERT INTO store_properties(key, value)
+VALUES ('detectoid_product_map_algorithm_version', $algorithmVersion)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
+                    versionCommand.Parameters.AddWithValue("$algorithmVersion", normalizedAlgorithmVersion);
+                    versionCommand.ExecuteNonQuery();
                 }
 
                 transaction.Commit();
@@ -1384,13 +1429,16 @@ FROM active_detectoids AS active;";
                     rebuiltAt = ParseCheckpointTimestamp(rebuiltAtValue);
                 }
 
+                var algorithmVersion = ReadProperty("detectoid_product_map_algorithm_version");
+
                 return new DetectoidProductMapStatus(
                     mappingCount,
                     mappedDetectoidCount,
                     productCount,
                     activeMappedDetectoidCount,
                     activeUnmappedDetectoidCount,
-                    rebuiltAt);
+                    rebuiltAt,
+                    algorithmVersion);
             }
             finally
             {

@@ -20,6 +20,9 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
     /// </summary>
     partial class MetadataSync
     {
+        private static readonly Guid DriversClassificationId =
+            new Guid("ebfc1fc5-71a4-4f7b-9aca-3b9a503104a0");
+
         public static void FetchConfiguration(FetchConfigurationOptions options)
         {
             MicrosoftUpdate.Source.Endpoint upstreamEndpoint;
@@ -136,19 +139,18 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
             Console.WriteLine("Building the detectoid-to-product map from cached category metadata ...");
             var result = ObservedProductMapBuilder.Rebuild(store);
             Console.WriteLine(
-                $"Mapped {result.MappingCount} detectoid/product pair(s) from " +
+                $"Mapped {result.MappingCount} strict detector/product pair(s) from " +
                 $"{result.DetectoidCount} detectoid(s) and {result.ConcreteProductCount} concrete product(s). " +
-                $"Sources: direct categories={result.DetectoidCategoryMappingCount}, " +
-                $"direct prerequisites={result.ProductPrerequisiteMappingCount}, " +
-                $"category hierarchy={result.CategoryHierarchyMappingCount}, " +
-                $"transitive prerequisites={result.TransitiveProductPrerequisiteMappingCount}, " +
-                $"direct product observations={result.ObservedProductCategoryMappingCount}.");
+                $"Sources: direct detectoid categories={result.DetectoidCategoryMappingCount}, " +
+                $"unique direct product prerequisites={result.ProductPrerequisiteMappingCount}. " +
+                "Direct ProductCategory observations, product-family expansion and transitive " +
+                "prerequisite inference are disabled.");
 
             if (result.AmbiguousDetectoidCount > 0)
             {
                 Console.WriteLine(
-                    $"Ignored {result.AmbiguousDetectoidCount} broad detectoid(s) that resolved to more than " +
-                    "16 equally-near products.");
+                    $"Ignored {result.AmbiguousDetectoidCount} ambiguous detector(s) whose direct evidence " +
+                    "points to more than one concrete product.");
             }
 
             if (result.SkippedPackageCount > 0)
@@ -246,9 +248,14 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
                 }
 
                 var initialMapStatus = observedInventoryStore.GetDetectoidProductMapStatus();
+                var mapUsesOldAlgorithm = !string.Equals(
+                    initialMapStatus.AlgorithmVersion,
+                    ObservedProductMapBuilder.MappingAlgorithmVersion,
+                    StringComparison.Ordinal);
                 var mapNeedsAutomaticRepair =
-                    initialMapStatus.MappingCount == 0
-                    && initialMapStatus.ActiveUnmappedDetectoidCount > 0;
+                    mapUsesOldAlgorithm
+                    || (initialMapStatus.MappingCount == 0
+                        && initialMapStatus.ActiveUnmappedDetectoidCount > 0);
                 if (!mapWasRebuilt
                     && (options.RebuildProductMap
                         || initialMapStatus.RebuiltAt == null
@@ -256,9 +263,11 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
                 {
                     if (mapNeedsAutomaticRepair && !options.RebuildProductMap)
                     {
-                        Console.WriteLine(
-                            "The cached detectoid-to-product map is empty while client detectoids are present; " +
-                            "rebuilding it with prerequisite/category graph traversal.");
+                        Console.WriteLine(mapUsesOldAlgorithm
+                            ? "The cached detectoid-to-product map was built by an older broad inference algorithm; " +
+                              "rebuilding it with strict direct-only product resolution."
+                            : "The cached detectoid-to-product map is empty while client detectors are present; " +
+                              "rebuilding it with strict direct-only product resolution.");
                     }
 
                     RebuildObservedProductMap(store);
@@ -330,6 +339,24 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
                 {
                     throw new InvalidOperationException(
                         "At least one --classification-filter GUID is required for fetch-observed.");
+                }
+
+                // Driver metadata is selected by observed PnP/computer identifiers in
+                // FetchObservedDrivers. Sending the Drivers classification once per
+                // observed product is both redundant and extremely broad.
+                if (classificationFilter.Remove(DriversClassificationId))
+                {
+                    Console.WriteLine(
+                        "The Drivers classification was removed from the observed-product phase; " +
+                        "drivers are fetched separately from observed hardware identifiers.");
+                }
+
+                if (classificationFilter.Count == 0)
+                {
+                    Console.WriteLine(
+                        "No software classification remains after removing Drivers. " +
+                        "Skipping the observed-product phase.");
+                    return;
                 }
 
                 var knownClassificationIds = store
@@ -483,10 +510,17 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
                 {
                     Console.WriteLine("Using cached categories. Pass --refresh-categories to update them.");
 
-                    if (store is IObservedInventoryStore observedInventoryStore
-                        && observedInventoryStore.GetDetectoidProductMapStatus().RebuiltAt == null)
+                    if (store is IObservedInventoryStore observedInventoryStore)
                     {
-                        RebuildObservedProductMap(store);
+                        var mapStatus = observedInventoryStore.GetDetectoidProductMapStatus();
+                        if (mapStatus.RebuiltAt == null
+                            || !string.Equals(
+                                mapStatus.AlgorithmVersion,
+                                ObservedProductMapBuilder.MappingAlgorithmVersion,
+                                StringComparison.Ordinal))
+                        {
+                            RebuildObservedProductMap(store);
+                        }
                     }
                 }
 
