@@ -11,8 +11,17 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
     {
         readonly private HashSet<MicrosoftUpdatePackageIdentity> ApprovedSoftwareUpdates;
         private bool AreAllSoftwareUpdatesApproved = true;
-        private bool AreAllDriverUpdatesApproved = true;
+
+        private enum DriverApprovalMode
+        {
+            All,
+            AllowList,
+            DenyList
+        }
+
+        private DriverApprovalMode DriverApprovals = DriverApprovalMode.All;
         readonly private HashSet<MicrosoftUpdatePackageIdentity> ApprovedDriverUpdates;
+        readonly private HashSet<MicrosoftUpdatePackageIdentity> DeniedDriverUpdates;
 
         /// <summary>
         /// Delegate method called to report updates applicable to a client but which are not approved and thus not offered
@@ -64,8 +73,20 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         /// <param name="approvedUpdate">Approved driver update</param>
         public void AddApprovedDriverUpdate(MicrosoftUpdatePackageIdentity approvedUpdate)
         {
-            AreAllDriverUpdatesApproved = false;
-            ApprovedDriverUpdates.Add(approvedUpdate);
+            if (DriverApprovals == DriverApprovalMode.All)
+            {
+                DriverApprovals = DriverApprovalMode.AllowList;
+                ApprovedDriverUpdates.Clear();
+            }
+
+            if (DriverApprovals == DriverApprovalMode.DenyList)
+            {
+                DeniedDriverUpdates.Remove(approvedUpdate);
+            }
+            else
+            {
+                ApprovedDriverUpdates.Add(approvedUpdate);
+            }
         }
 
         /// <summary>
@@ -75,10 +96,9 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         /// <param name="approvedUpdates"></param>
         public void AddApprovedDriverUpdates(IEnumerable<MicrosoftUpdatePackageIdentity> approvedUpdates)
         {
-            AreAllDriverUpdatesApproved = false;
             foreach (var approvedUpdate in approvedUpdates)
             {
-                ApprovedDriverUpdates.Add(approvedUpdate);
+                AddApprovedDriverUpdate(approvedUpdate);
             }
         }
 
@@ -99,7 +119,20 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         /// <param name="updateIdentity">Identity of update to un-approve</param>
         public void RemoveApprovedDriverUpdate(MicrosoftUpdatePackageIdentity updateIdentity)
         {
-            ApprovedDriverUpdates.Remove(updateIdentity);
+            if (DriverApprovals == DriverApprovalMode.All)
+            {
+                DriverApprovals = DriverApprovalMode.DenyList;
+                DeniedDriverUpdates.Clear();
+            }
+
+            if (DriverApprovals == DriverApprovalMode.AllowList)
+            {
+                ApprovedDriverUpdates.Remove(updateIdentity);
+            }
+            else
+            {
+                DeniedDriverUpdates.Add(updateIdentity);
+            }
         }
 
         /// <summary>
@@ -108,7 +141,20 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         /// </summary>
         public void ClearApprovedDriverUpdates()
         {
+            DriverApprovals = DriverApprovalMode.AllowList;
             ApprovedDriverUpdates.Clear();
+            DeniedDriverUpdates.Clear();
+        }
+
+        private bool IsDriverUpdateApproved(MicrosoftUpdatePackageIdentity updateIdentity)
+        {
+            return DriverApprovals switch
+            {
+                DriverApprovalMode.All => true,
+                DriverApprovalMode.AllowList => ApprovedDriverUpdates.Contains(updateIdentity),
+                DriverApprovalMode.DenyList => !DeniedDriverUpdates.Contains(updateIdentity),
+                _ => false
+            };
         }
 
         /// <summary>

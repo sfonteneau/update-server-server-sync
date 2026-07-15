@@ -23,9 +23,8 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                 return;
             }
 
-            // InstalledNonLeafUpdateIDs can contain broad product-category nodes.
-            // The SQLite resolver deliberately returns only actual detectoid packages
-            // so a category node alone cannot activate an unrelated product fetch.
+            // WUA can report both detectoids and product-category nodes in
+            // InstalledNonLeafUpdateIDs. Both are useful product detectors.
             var detectorIdentities = MetadataSource.GetObservedDetectorIdentities(
                 parameters.InstalledNonLeafUpdateIDs ?? Array.Empty<int>());
             var detectoids = detectorIdentities.Values

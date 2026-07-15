@@ -75,8 +75,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                     continue;
                 }
 
-                if (!AreAllDriverUpdatesApproved
-                    && !ApprovedDriverUpdates.Contains(driverMatchResult.Driver.Id))
+                if (!IsDriverUpdateApproved(driverMatchResult.Driver.Id))
                 {
                     unapprovedDriversMatched.Add(driverMatchResult.Driver);
                     continue;
@@ -120,12 +119,39 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
             }
 
             syncResult.NewUpdates = driverUpdates.ToArray();
+            System.Diagnostics.Trace.TraceInformation(
+                $"Client driver sync: devices={parameters.SystemSpec?.Length ?? 0}, " +
+                $"offered={driverUpdates.Count}, unapproved={unapprovedDriversMatched.Count}, " +
+                $"truncated={syncResult.Truncated}.");
             return Task.FromResult(syncResult);
         }
 
         private static int GetEffectiveMatchIndex(int index)
         {
             return index < 0 ? int.MaxValue : index;
+        }
+
+        private static int IndexOfHardwareId(
+            IReadOnlyList<string> hardwareIds,
+            string hardwareId)
+        {
+            if (hardwareIds == null || hardwareId == null)
+            {
+                return int.MaxValue;
+            }
+
+            for (var index = 0; index < hardwareIds.Count; index++)
+            {
+                if (string.Equals(
+                    hardwareIds[index],
+                    hardwareId,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    return index;
+                }
+            }
+
+            return int.MaxValue;
         }
 
         /// <summary>
@@ -186,10 +212,12 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
 
             // The installed and matched drivers have the same ranking so far; compare them by how specific is the hardware id match
 
-            var installedDriverMatchIndex = GetEffectiveMatchIndex(
-                hardwareIdList.IndexOf(installedDriver.MatchingID));
-            var matchResultMatchIndex = GetEffectiveMatchIndex(
-                hardwareIdList.IndexOf(matchResult.MatchedHardwareId));
+            var installedDriverMatchIndex = IndexOfHardwareId(
+                hardwareIdList,
+                installedDriver.MatchingID);
+            var matchResultMatchIndex = IndexOfHardwareId(
+                hardwareIdList,
+                matchResult.MatchedHardwareId);
             if (installedDriverMatchIndex == matchResultMatchIndex)
             {
                 // Both our driver match and the installed driver matched the same HWID. Figure out the best one by comparing versions

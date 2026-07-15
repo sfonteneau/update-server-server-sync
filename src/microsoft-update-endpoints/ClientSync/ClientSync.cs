@@ -42,6 +42,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         {
             ApprovedSoftwareUpdates = new HashSet<MicrosoftUpdatePackageIdentity>();
             ApprovedDriverUpdates = new HashSet<MicrosoftUpdatePackageIdentity>();
+            DeniedDriverUpdates = new HashSet<MicrosoftUpdatePackageIdentity>();
         }
 
         /// <summary>

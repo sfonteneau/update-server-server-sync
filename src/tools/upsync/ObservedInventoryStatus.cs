@@ -66,9 +66,8 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
             var productMapStatus = observedInventoryStore.GetDetectoidProductMapStatus(seenSince);
             Console.WriteLine(
                 $"Product map             : {productMapStatus.MappingCount,8} pair(s), " +
-                $"{productMapStatus.MappedDetectoidCount} detector(s), " +
+                $"{productMapStatus.MappedDetectoidCount} detectoid(s), " +
                 $"{productMapStatus.ProductCount} product(s), " +
-                $"algorithm={productMapStatus.AlgorithmVersion ?? "unknown"}, " +
                 $"rebuilt={FormatTimestamp(productMapStatus.RebuiltAt)}");
             Console.WriteLine(
                 $"Detectoid resolution    : {productMapStatus.ActiveMappedDetectoidCount,8} mapped / " +

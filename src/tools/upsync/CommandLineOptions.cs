@@ -252,7 +252,7 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
         [Option("upstream-timeout-minutes", Required = false, Default = 3, HelpText = "SOAP timeout in minutes for requests to the upstream update server. Must be greater than zero.")]
         public int UpstreamTimeoutMinutes { get; set; }
 
-        [Option("classification-filter", Required = false, Separator = '+', HelpText = "Software classification GUIDs to fetch for each observed product; Drivers are fetched separately from observed hardware IDs")]
+        [Option("classification-filter", Required = false, Separator = '+', HelpText = "Classification GUIDs to fetch for each observed product; required unless --skip-products is used")]
         public IEnumerable<string> ClassificationsFilter { get; set; }
 
         [Option("language-filter", Required = false, Separator = '+', HelpText = "Language LCIDs or short names to sync. Default: 1033/en. Use all to disable the language filter")]

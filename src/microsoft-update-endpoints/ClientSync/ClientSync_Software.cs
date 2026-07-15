@@ -64,10 +64,6 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                 response,
                 nonLeafResponse: false))
             {
-                // WUA must call SyncUpdates again after it learns the bundle
-                // metadata, otherwise the final standalone leaf stage is never
-                // reached during the same scan.
-                response.Truncated = true;
                 return Task.FromResult(response);
             }
 
@@ -107,13 +103,13 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                 ? CreateUpdateInfoListFromNonLeafUpdates(packages).ToArray()
                 : CreateUpdateInfoListFromSoftwareUpdates(packages).ToArray();
 
-            // Root and non-leaf metadata are evaluated by WUA before the next
-            // graph level becomes applicable. Always request another SyncUpdates
-            // call for these stages; deciding from the current installed list can
-            // terminate discovery before any leaf update is offered.
+            // Match the historical in-memory implementation: every non-leaf
+            // discovery stage must force another SyncUpdates call so WUA can
+            // evaluate the metadata before the next graph level is selected.
             response.Truncated = stage == ClientSyncSoftwareStage.Leaf
                 ? truncated
                 : true;
+
             System.Diagnostics.Trace.TraceInformation(
                 $"Client software stage {stage}: offered={response.NewUpdates?.Length ?? 0}, " +
                 $"sql_truncated={truncated}, response_truncated={response.Truncated}.");

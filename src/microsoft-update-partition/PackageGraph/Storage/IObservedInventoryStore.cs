@@ -265,9 +265,6 @@ namespace Microsoft.PackageGraph.Storage
         /// <summary>Gets when the map was last rebuilt.</summary>
         public DateTimeOffset? RebuiltAt { get; }
 
-        /// <summary>Gets the mapping algorithm version that produced the cached map.</summary>
-        public string AlgorithmVersion { get; }
-
         /// <summary>Creates mapping status information.</summary>
         public DetectoidProductMapStatus(
             long mappingCount,
@@ -275,8 +272,7 @@ namespace Microsoft.PackageGraph.Storage
             long productCount,
             long activeMappedDetectoidCount,
             long activeUnmappedDetectoidCount,
-            DateTimeOffset? rebuiltAt,
-            string algorithmVersion)
+            DateTimeOffset? rebuiltAt)
         {
             MappingCount = mappingCount;
             MappedDetectoidCount = mappedDetectoidCount;
@@ -284,7 +280,6 @@ namespace Microsoft.PackageGraph.Storage
             ActiveMappedDetectoidCount = activeMappedDetectoidCount;
             ActiveUnmappedDetectoidCount = activeUnmappedDetectoidCount;
             RebuiltAt = rebuiltAt;
-            AlgorithmVersion = algorithmVersion;
         }
     }
 
@@ -379,8 +374,7 @@ namespace Microsoft.PackageGraph.Storage
         /// <summary>Replaces the derived detectoid-to-product map atomically.</summary>
         void ReplaceDetectoidProductMappings(
             IEnumerable<DetectoidProductMapping> mappings,
-            DateTimeOffset rebuiltAt,
-            string algorithmVersion);
+            DateTimeOffset rebuiltAt);
 
         /// <summary>Gets concrete products resolved from observed detectoids.</summary>
         IReadOnlyList<ObservedProductCategory> GetObservedProductCategories(DateTimeOffset? seenSince = null);
