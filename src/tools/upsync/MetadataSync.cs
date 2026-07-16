@@ -20,6 +20,15 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
     /// </summary>
     partial class MetadataSync
     {
+        // Microsoft Update classification "Drivers". Driver metadata must not be
+        // fetched through the observed-product GetRevisionIdList path: that path
+        // can expand a broad product category such as "Windows 10 and later
+        // drivers" into hundreds of thousands of revisions. Observed drivers are
+        // fetched only by FetchObservedDrivers through GetDriverIdList, using the
+        // PnP, Compatible and Computer Hardware IDs recorded from client scans.
+        private static readonly Guid DriversClassificationId =
+            new Guid("ebfc1fc5-71a4-4f7b-9aca-3b9a503104a0");
+
         public static void FetchConfiguration(FetchConfigurationOptions options)
         {
             MicrosoftUpdate.Source.Endpoint upstreamEndpoint;
@@ -322,21 +331,17 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
                     return;
                 }
 
-                var classificationFilter = CreateFilterListForCategory<ClassificationCategory>(
+                var userSpecifiedClassifications = HasValues(options.ClassificationsFilter);
+                var requestedClassificationFilter = CreateFilterListForCategory<ClassificationCategory>(
                     options.ClassificationsFilter,
                     store,
-                    includeAllWhenEmpty: false);
-                if (classificationFilter.Count == 0)
-                {
-                    throw new InvalidOperationException(
-                        "At least one --classification-filter GUID is required for fetch-observed.");
-                }
+                    includeAllWhenEmpty: true);
 
                 var knownClassificationIds = store
                     .OfType<ClassificationCategory>()
                     .Select(classification => classification.Id.ID)
                     .ToHashSet();
-                var unknownClassificationIds = classificationFilter
+                var unknownClassificationIds = requestedClassificationFilter
                     .Where(classificationId => !knownClassificationIds.Contains(classificationId))
                     .ToList();
                 if (unknownClassificationIds.Count > 0)
@@ -347,6 +352,51 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
                         ". Run pre-fetch or use --refresh-categories.");
                 }
 
+                var driversClassificationWasRequested = requestedClassificationFilter
+                    .Contains(DriversClassificationId);
+                var classificationFilter = requestedClassificationFilter
+                    .Where(classificationId => classificationId != DriversClassificationId)
+                    .Distinct()
+                    .ToList();
+
+                if (driversClassificationWasRequested)
+                {
+                    if (userSpecifiedClassifications)
+                    {
+                        ConsoleOutput.WriteRed(
+                            "Warning: the Drivers classification was ignored for the observed-product phase. " +
+                            "Drivers are fetched only by GetDriverIdList from observed hardware identifiers.");
+                    }
+                    else
+                    {
+                        Console.WriteLine(
+                            "The Drivers classification was automatically excluded from the observed-product phase. " +
+                            "Drivers are fetched only by GetDriverIdList from observed hardware identifiers.");
+                    }
+                }
+
+                if (classificationFilter.Count == 0)
+                {
+                    if (userSpecifiedClassifications)
+                    {
+                        if (options.SkipDrivers)
+                        {
+                            throw new InvalidOperationException(
+                                "The only selected classification was Drivers, but Drivers are excluded from the " +
+                                "observed-product phase and --skip-drivers disables the dedicated GetDriverIdList phase.");
+                        }
+
+                        Console.WriteLine(
+                            "No software classification remains after excluding Drivers. " +
+                            "The observed-product phase has nothing to fetch; the observed-driver phase will continue.");
+                        return;
+                    }
+
+                    throw new InvalidOperationException(
+                        "The local pre-fetch catalog contains no non-driver classification. " +
+                        "Run pre-fetch again or use --refresh-categories.");
+                }
+
                 var languageFilter = CreateLanguageFilter(options.LanguageFilter);
                 var stripUnrequestedLocalizedProperties =
                     languageFilter.Count > 0 && !options.KeepAllLocalizedProperties;
@@ -355,6 +405,9 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
                     $"Products selected  : {selectedProducts.Count}; " +
                     $"classifications={classificationFilter.Count}; " +
                     $"languages={(languageFilter.Count == 0 ? "all" : string.Join(",", languageFilter))}");
+                Console.WriteLine(userSpecifiedClassifications
+                    ? "Classification mode: explicit software classification filter (Drivers always excluded)."
+                    : "Classification mode: all locally known software classifications (Drivers excluded).");
 
                 if (options.DryRun)
                 {

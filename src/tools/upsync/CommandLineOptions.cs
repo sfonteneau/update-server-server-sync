@@ -228,7 +228,9 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
         public IEnumerable<string> Ids { get; set; }
     }
 
-    [Verb("fetch-observed", HelpText = "Fetches product updates and drivers observed during Windows Update client scans")]
+    [Verb(
+        "fetch-observed",
+        HelpText = "Fetches software updates for observed products (all known non-Driver classifications by default) and separately fetches drivers through GetDriverIdList using observed hardware identifiers")]
     public class FetchObservedOptions : IMetadataStoreOptions, IMetadataSourceOptions, IIncrementalSyncOptions, IUpstreamTimeoutOptions
     {
         [Option("store-alias", Required = false, HelpText = "Destination store alias")]
@@ -252,7 +254,11 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
         [Option("upstream-timeout-minutes", Required = false, Default = 3, HelpText = "SOAP timeout in minutes for requests to the upstream update server. Must be greater than zero.")]
         public int UpstreamTimeoutMinutes { get; set; }
 
-        [Option("classification-filter", Required = false, Separator = '+', HelpText = "Classification GUIDs to fetch for each observed product; required unless --skip-products is used")]
+        [Option(
+            "classification-filter",
+            Required = false,
+            Separator = '+',
+            HelpText = "Optional software classification GUIDs to fetch for each observed product. When omitted, all locally known classifications except Drivers are used. The Drivers classification is always handled exclusively by GetDriverIdList.")]
         public IEnumerable<string> ClassificationsFilter { get; set; }
 
         [Option("language-filter", Required = false, Separator = '+', HelpText = "Language LCIDs or short names to sync. Default: 1033/en. Use all to disable the language filter")]
