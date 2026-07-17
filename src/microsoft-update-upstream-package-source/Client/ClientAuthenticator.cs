@@ -2,7 +2,9 @@
 // Licensed under the MIT License.
 
 using System;
+using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Threading.Tasks;
 using Microsoft.UpdateServices.WebServices.DssAuthentication;
 using Microsoft.UpdateServices.WebServices.ServerSync;
@@ -23,6 +25,8 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
     /// </example>
     class ClientAuthenticator
     {
+        private const int TransientRequestAttempts = 5;
+
         private readonly TimeSpan RequestTimeout;
         /// <summary>
         /// Gets the update server endpoint this instance of ClientAuthenticator authenticates with.
@@ -102,6 +106,77 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         }
 
         /// <summary>
+        /// Retries transient HTTP/WCF transport failures. A fresh generated WCF client is created by
+        /// the supplied operation on every attempt because a client whose channel faulted cannot be
+        /// relied on for the next request.
+        /// </summary>
+        private static async Task<T> ExecuteWithTransientRetry<T>(Func<Task<T>> operation, string operationName)
+        {
+            Exception lastException = null;
+
+            for (var attempt = 1; attempt <= TransientRequestAttempts; attempt++)
+            {
+                try
+                {
+                    return await operation();
+                }
+                catch (Exception ex) when (IsTransientTransportFailure(ex))
+                {
+                    lastException = ex;
+                    if (attempt == TransientRequestAttempts)
+                    {
+                        break;
+                    }
+
+                    var delay = TimeSpan.FromSeconds(1 << (attempt - 1));
+                    System.Diagnostics.Trace.TraceWarning(
+                        $"Transient upstream failure during {operationName}; " +
+                        $"retrying in {delay.TotalSeconds:0} second(s) " +
+                        $"(attempt {attempt}/{TransientRequestAttempts}): " +
+                        ex.GetBaseException().Message);
+                    await Task.Delay(delay);
+                }
+            }
+
+            throw new System.ServiceModel.CommunicationException(
+                $"{operationName} failed after {TransientRequestAttempts} transient attempt(s).",
+                lastException);
+        }
+
+        private static bool IsTransientTransportFailure(Exception exception)
+        {
+            // SOAP faults are valid server responses and must keep their existing semantic handling.
+            if (ContainsSoapFault(exception))
+            {
+                return false;
+            }
+
+            if (exception is TimeoutException ||
+                exception is System.ServiceModel.CommunicationException ||
+                exception is HttpRequestException ||
+                exception is IOException)
+            {
+                return true;
+            }
+
+            return exception.InnerException != null &&
+                !ReferenceEquals(exception.InnerException, exception) &&
+                IsTransientTransportFailure(exception.InnerException);
+        }
+
+        private static bool ContainsSoapFault(Exception exception)
+        {
+            if (exception is System.ServiceModel.FaultException)
+            {
+                return true;
+            }
+
+            return exception.InnerException != null &&
+                !ReferenceEquals(exception.InnerException, exception) &&
+                ContainsSoapFault(exception.InnerException);
+        }
+
+        /// <summary>
         /// Performs authentication with an upstream update server, using a previously issued service access token.
         /// </summary>
         /// <remarks>
@@ -176,20 +251,23 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// <returns>List of supported authentication methods</returns>
         private async Task<AuthPlugInInfo[]> GetAuthenticationInfo()
         {
-            GetAuthConfigResponse authConfigResponse;
-
-            var httpBinding = CreateHttpBinding();
             var upstreamEndpoint = new System.ServiceModel.EndpointAddress(UpstreamEndpoint.ServerSyncURI);
-            if (upstreamEndpoint.Uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
-            {
-                httpBinding.Security.Mode = System.ServiceModel.BasicHttpSecurityMode.Transport;
-            }
+            var authConfigResponse = await ExecuteWithTransientRetry(
+                async () =>
+                {
+                    var httpBinding = CreateHttpBinding();
+                    if (upstreamEndpoint.Uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
+                    {
+                        httpBinding.Security.Mode = System.ServiceModel.BasicHttpSecurityMode.Transport;
+                    }
 
-            // Create a WSUS server sync client
-            IServerSyncWebService serverSyncClient = new ServerSyncWebServiceClient(httpBinding, upstreamEndpoint);
-
-            // Retrieve the authentication information
-            authConfigResponse = await serverSyncClient.GetAuthConfigAsync(new GetAuthConfigRequest());
+                    // Create a fresh client for every attempt. WCF channels may remain faulted after
+                    // a premature HTTP response and cannot safely be reused.
+                    IServerSyncWebService serverSyncClient =
+                        new ServerSyncWebServiceClient(httpBinding, upstreamEndpoint);
+                    return await serverSyncClient.GetAuthConfigAsync(new GetAuthConfigRequest());
+                },
+                "upstream authentication configuration request");
 
             if (authConfigResponse == null)
             {
@@ -209,16 +287,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// <returns>An authentication cookie</returns>
         private async Task<UpdateServices.WebServices.DssAuthentication.AuthorizationCookie> GetAuthorizationCookie(AuthPlugInInfo authInfo)
         {
-            var httpBinding = CreateHttpBinding();
             var upstreamEndpoint = new System.ServiceModel.EndpointAddress(UpstreamEndpoint.GetAuthenticationEndpointFromRelativeUrl(authInfo.ServiceUrl));
-
-            if (upstreamEndpoint.Uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
-            {
-                httpBinding.Security.Mode = System.ServiceModel.BasicHttpSecurityMode.Transport;
-            }
-
-            // Create a DSS client using the endpoint retrieved above
-            IDSSAuthWebService authenticationService = new DSSAuthWebServiceClient(httpBinding, upstreamEndpoint);
 
             // Issue the request. All accounts are allowed, so we just generate a random account guid and name
             var cookieRequest = new GetAuthorizationCookieRequest
@@ -230,7 +299,20 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
                 }
             };
 
-            var getAuthCookieResponse = await authenticationService.GetAuthorizationCookieAsync(cookieRequest);
+            var getAuthCookieResponse = await ExecuteWithTransientRetry(
+                async () =>
+                {
+                    var httpBinding = CreateHttpBinding();
+                    if (upstreamEndpoint.Uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
+                    {
+                        httpBinding.Security.Mode = System.ServiceModel.BasicHttpSecurityMode.Transport;
+                    }
+
+                    IDSSAuthWebService authenticationService =
+                        new DSSAuthWebServiceClient(httpBinding, upstreamEndpoint);
+                    return await authenticationService.GetAuthorizationCookieAsync(cookieRequest);
+                },
+                "upstream authorization-cookie request");
 
             if (getAuthCookieResponse == null ||
                 getAuthCookieResponse.GetAuthorizationCookieResponse1.GetAuthorizationCookieResult.CookieData == null)
@@ -248,15 +330,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
         /// <returns>An access cookie</returns>
         private async Task<Cookie> GetServerAccessCookie(UpdateServices.WebServices.DssAuthentication.AuthorizationCookie authCookie)
         {
-            var httpBinding = CreateHttpBinding();
             var upstreamEndpoint = new System.ServiceModel.EndpointAddress(UpstreamEndpoint.ServerSyncURI);
-            if (upstreamEndpoint.Uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
-            {
-                httpBinding.Security.Mode = System.ServiceModel.BasicHttpSecurityMode.Transport;
-            }
-
-            // Create a service client on the default Microsoft upstream server.
-            IServerSyncWebService serverSyncClient = new ServerSyncWebServiceClient(httpBinding, upstreamEndpoint);
 
             // Create an access cookie request using the authentication cookie parameter.
             var cookieRequest = new GetCookieRequest
@@ -285,9 +359,22 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
             GetCookieResponse cookieResponse;
             try
             {
-                cookieResponse = await serverSyncClient.GetCookieAsync(cookieRequest);
+                cookieResponse = await ExecuteWithTransientRetry(
+                    async () =>
+                    {
+                        var httpBinding = CreateHttpBinding();
+                        if (upstreamEndpoint.Uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
+                        {
+                            httpBinding.Security.Mode = System.ServiceModel.BasicHttpSecurityMode.Transport;
+                        }
+
+                        IServerSyncWebService serverSyncClient =
+                            new ServerSyncWebServiceClient(httpBinding, upstreamEndpoint);
+                        return await serverSyncClient.GetCookieAsync(cookieRequest);
+                    },
+                    "upstream access-cookie request");
             }
-            catch(System.ServiceModel.FaultException ex)
+            catch (System.ServiceModel.FaultException ex)
             {
                 throw new UpstreamServerException(ex);
             }
