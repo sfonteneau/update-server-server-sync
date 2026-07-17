@@ -16,8 +16,11 @@ Visual Studio 2022 with .Net Core development tools is required to build the sol
 ## Use 
 
 "/opt/upsync/upsync" pre-fetch --store-path "/opt/upsync/store"
+
 "/opt/upsync/upsync" run-update-server --metadata-store-path "/opt/upsync/store"
+
 "/opt/upsync/upsync" fetch-observed   --store-path /opt/upsync/store   --skip-products   --seen-within-days 30   --language-filter en   --upstream-timeout-minutes 1500
+
 "/opt/upsync/upsync" run-update-server --metadata-store-path "/opt/upsync/store"
 
 ## Use the upsync utility
