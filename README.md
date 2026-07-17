@@ -13,12 +13,12 @@ Use this library to
 
 Visual Studio 2022 with .Net Core development tools is required to build the solution provided at build\microsoft-update.sln
 
-## Use the library
+## Use 
 
-Please refer to the [API documentation](https://microsoft.github.io/update-server-server-sync/) for help on using the library.
-
-[Code samples](https://microsoft.github.io/update-server-server-sync/examples/categories-fetch.html)
-
+"/opt/upsync/upsync" pre-fetch --store-path "/opt/upsync/store"
+"/opt/upsync/upsync" run-update-server --metadata-store-path "/opt/upsync/store"
+"/opt/upsync/upsync" fetch-observed   --store-path /opt/upsync/store   --skip-products   --seen-within-days 30   --language-filter en   --upstream-timeout-minutes 1500
+"/opt/upsync/upsync" run-update-server --metadata-store-path "/opt/upsync/store"
 
 ## Use the upsync utility
 The upsync command line utility is provided as a sample for using the library. Upsync can be used to browse Microsoft's update catalog, sync updates locally and serve them to Windows Update clients or downstream WSUS servers.
