@@ -28,13 +28,13 @@ namespace Microsoft.PackageGraph.Storage.Local
     /// connection and uses precomputed SQLite read models. A bounded metadata LRU
     /// avoids repeatedly decompressing and parsing the same selected packages.
     /// </summary>
-    internal sealed class SQLiteClientSyncMetadataStore : IClientSyncMetadataStore
+    internal sealed class SQLiteClientSyncMetadataStore : IClientSyncProjectionStore
     {
-        private const int RequiredSchemaVersion = 9;
+        private const int RequiredSchemaVersion = 10;
         private const int MaxObservedValuesPerType = 20000;
         private const int MaxObservedIdentifierLength = 2048;
-        private const int MetadataCacheCapacity = 1024;
-        private const long MetadataCacheMaxBytes = 256L * 1024L * 1024L;
+        private const int MetadataCacheCapacity = 128;
+        private const long MetadataCacheMaxBytes = 64L * 1024L * 1024L;
         private const string CompressionNone = "none";
         private const string CompressionBrotli = "br";
         private const string CompressionGZip = "gzip";
@@ -67,10 +67,15 @@ namespace Microsoft.PackageGraph.Storage.Local
             {
                 DataSource = DatabasePath,
                 Mode = SqliteOpenMode.ReadWrite,
-                Cache = SqliteCacheMode.Shared
+                // Shared-cache mode adds table-level locks that return SQLITE_LOCKED
+                // immediately under concurrent inventory writers. Private page caches
+                // preserve WAL concurrency; connections are short-lived and SQLite's
+                // default cache remains bounded per connection.
+                Cache = SqliteCacheMode.Private
             }.ToString();
 
             using var connection = OpenConnection();
+            ClientSyncFragmentSchemaMigrator.TryMigrate(connection);
             ValidateSchema(connection);
         }
 
@@ -314,13 +319,86 @@ WHERE identity = $identity
                 return Array.Empty<ClientSyncPackageRecord>();
             }
 
-            var totalStopwatch = Stopwatch.StartNew();
-            var queryStopwatch = Stopwatch.StartNew();
             var excluded = new HashSet<Guid>(installedNonLeafUpdateIds ?? Array.Empty<Guid>());
             excluded.UnionWith(otherCachedUpdateIds ?? Array.Empty<Guid>());
             var selected = new List<(int PackageIndex, bool IsBundle, bool IsBundled)>(maxResults + 1);
             using var connection = OpenConnection();
             EnsureMetadataCacheGeneration(connection);
+            PopulateTemporaryGuidTable(
+                connection,
+                "temp_client_sync_installed",
+                installedNonLeafUpdateIds ?? Array.Empty<Guid>());
+            PopulateTemporaryGuidTable(connection, "temp_client_sync_excluded", excluded);
+            PopulateTemporaryTextTable(
+                connection,
+                "temp_client_sync_approved",
+                (approvedSoftwareUpdates ?? Array.Empty<MicrosoftUpdatePackageIdentity>())
+                    .Where(identity => identity != null)
+                    .Select(identity => identity.ToString()));
+
+            using var command = connection.CreateCommand();
+            command.CommandText = BuildSoftwareCandidateQuery(stage, includeCoreXml: false);
+            command.Parameters.AddWithValue("$driverType", (int)StoredPackageType.MicrosoftUpdateDriver);
+            command.Parameters.AddWithValue("$softwareType", (int)StoredPackageType.MicrosoftUpdateSoftware);
+            command.Parameters.AddWithValue("$approveAll", approveAllSoftwareUpdates ? 1 : 0);
+            command.Parameters.AddWithValue("$limit", maxResults + 1);
+
+            using (var reader = command.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    selected.Add((
+                        reader.GetInt32(0),
+                        reader.GetInt64(1) != 0,
+                        reader.GetInt64(2) != 0));
+                }
+            }
+
+            truncated = selected.Count > maxResults;
+            if (truncated)
+            {
+                selected.RemoveAt(selected.Count - 1);
+            }
+
+            var results = new List<ClientSyncPackageRecord>(selected.Count);
+            foreach (var candidate in selected)
+            {
+                var package = LoadPackageByIndex(connection, candidate.PackageIndex);
+                if (package != null)
+                {
+                    results.Add(new ClientSyncPackageRecord(
+                        candidate.PackageIndex,
+                        package,
+                        candidate.IsBundle,
+                        candidate.IsBundled));
+                }
+            }
+
+            return results;
+        }
+
+        public IReadOnlyList<ClientSyncSoftwareCandidateRecord> GetSoftwareCandidateProjections(
+            ClientSyncSoftwareStage stage,
+            IReadOnlyCollection<Guid> installedNonLeafUpdateIds,
+            IReadOnlyCollection<Guid> otherCachedUpdateIds,
+            bool approveAllSoftwareUpdates,
+            IReadOnlyCollection<MicrosoftUpdatePackageIdentity> approvedSoftwareUpdates,
+            int maxResults,
+            out bool truncated)
+        {
+            ThrowIfDisposed();
+            if (maxResults <= 0)
+            {
+                truncated = false;
+                return Array.Empty<ClientSyncSoftwareCandidateRecord>();
+            }
+
+            var totalStopwatch = Stopwatch.StartNew();
+            var excluded = new HashSet<Guid>(installedNonLeafUpdateIds ?? Array.Empty<Guid>());
+            excluded.UnionWith(otherCachedUpdateIds ?? Array.Empty<Guid>());
+            var results = new List<ClientSyncSoftwareCandidateRecord>(maxResults + 1);
+
+            using var connection = OpenConnection();
             PopulateTemporaryGuidTable(
                 connection,
                 "temp_client_sync_installed",
@@ -337,7 +415,7 @@ WHERE identity = $identity
                     .Select(identity => identity.ToString()));
 
             using var command = connection.CreateCommand();
-            command.CommandText = BuildSoftwareCandidateQuery(stage);
+            command.CommandText = BuildSoftwareCandidateQuery(stage, includeCoreXml: true);
             command.Parameters.AddWithValue("$driverType", (int)StoredPackageType.MicrosoftUpdateDriver);
             command.Parameters.AddWithValue("$softwareType", (int)StoredPackageType.MicrosoftUpdateSoftware);
             command.Parameters.AddWithValue("$approveAll", approveAllSoftwareUpdates ? 1 : 0);
@@ -347,45 +425,24 @@ WHERE identity = $identity
             {
                 while (reader.Read())
                 {
-                    selected.Add((
+                    results.Add(new ClientSyncSoftwareCandidateRecord(
                         reader.GetInt32(0),
+                        reader.GetString(3),
                         reader.GetInt64(1) != 0,
                         reader.GetInt64(2) != 0));
                 }
             }
-            queryStopwatch.Stop();
 
-            truncated = selected.Count > maxResults;
+            truncated = results.Count > maxResults;
             if (truncated)
             {
-                selected.RemoveAt(selected.Count - 1);
+                results.RemoveAt(results.Count - 1);
             }
 
-            var materializeStopwatch = Stopwatch.StartNew();
-            var results = new List<ClientSyncPackageRecord>(selected.Count);
-            foreach (var candidate in selected)
-            {
-                var package = LoadPackageByIndex(connection, candidate.PackageIndex);
-                if (package == null)
-                {
-                    continue;
-                }
-
-                results.Add(new ClientSyncPackageRecord(
-                    candidate.PackageIndex,
-                    package,
-                    candidate.IsBundle,
-                    candidate.IsBundled));
-            }
-            materializeStopwatch.Stop();
             totalStopwatch.Stop();
-
             Trace.TraceInformation(
-                $"Client software scan stage={stage}: selected={selected.Count}, returned={results.Count}, " +
-                $"truncated={truncated}, sql_ms={queryStopwatch.ElapsedMilliseconds}, " +
-                $"materialize_ms={materializeStopwatch.ElapsedMilliseconds}, total_ms={totalStopwatch.ElapsedMilliseconds}, " +
-                $"cache_hits={Interlocked.Read(ref MetadataCacheHits)}, cache_misses={Interlocked.Read(ref MetadataCacheMisses)}.");
-
+                $"Client software scan stage={stage}: returned={results.Count}, " +
+                $"truncated={truncated}, total_ms={totalStopwatch.ElapsedMilliseconds}.");
             return results;
         }
 
@@ -475,15 +532,30 @@ LIMIT 1;";
             IEnumerable<Guid> computerHardwareIds,
             IReadOnlyCollection<Guid> installedPrerequisites)
         {
+            var results = MatchDrivers(
+                new[] { new ClientSyncDriverMatchRequest(hardwareIds) },
+                computerHardwareIds,
+                installedPrerequisites);
+            return results.Count == 0 ? null : results[0]?.MatchResult;
+        }
+
+        public IReadOnlyList<ClientSyncDriverMatchRecord> MatchDrivers(
+            IReadOnlyList<ClientSyncDriverMatchRequest> requests,
+            IEnumerable<Guid> computerHardwareIds,
+            IReadOnlyCollection<Guid> installedPrerequisites)
+        {
             ThrowIfDisposed();
-            var normalizedHardwareIds = (hardwareIds ?? Array.Empty<string>())
-                .Where(value => !string.IsNullOrWhiteSpace(value))
-                .Select(value => value.Trim().ToLowerInvariant())
-                .Distinct(StringComparer.Ordinal)
-                .ToList();
+            var requestedDevices = requests ?? Array.Empty<ClientSyncDriverMatchRequest>();
+            if (requestedDevices.Count == 0)
+            {
+                return Array.Empty<ClientSyncDriverMatchRecord>();
+            }
+
             var computerIds = (computerHardwareIds ?? Array.Empty<Guid>()).ToList();
+            var results = new List<ClientSyncDriverMatchRecord>(requestedDevices.Count);
+            var responseProjectionByPackage = new Dictionary<int, ClientSyncResponseProjection>();
             var stopwatch = Stopwatch.StartNew();
-            var candidateCount = 0;
+            var matchedCount = 0;
 
             using var connection = OpenConnection();
             EnsureMetadataCacheGeneration(connection);
@@ -491,43 +563,92 @@ LIMIT 1;";
                 connection,
                 "temp_client_sync_installed",
                 installedPrerequisites ?? Array.Empty<Guid>());
-            foreach (var hardwareId in normalizedHardwareIds)
+
+            foreach (var request in requestedDevices)
             {
-                var candidates = ReadDriverCandidates(connection, hardwareId);
-                candidateCount += candidates.Count;
-                if (candidates.Count == 0)
+                var result = MatchDriver(
+                    connection,
+                    request?.HardwareIds ?? Array.Empty<string>(),
+                    computerIds,
+                    responseProjectionByPackage);
+                results.Add(result);
+                if (result != null)
                 {
-                    continue;
-                }
-
-                var matched = MatchDriverCandidates(candidates, computerIds);
-                if (matched != null)
-                {
-                    var driver = LoadPackageByIndex(connection, matched.Candidate.PackageIndex) as DriverUpdate;
-                    if (driver == null)
-                    {
-                        continue;
-                    }
-
-                    stopwatch.Stop();
-                    Trace.TraceInformation(
-                        $"Client driver match: hardware_ids={normalizedHardwareIds.Count}, " +
-                        $"candidates={candidateCount}, selected_package={matched.Candidate.PackageIndex}, " +
-                        $"total_ms={stopwatch.ElapsedMilliseconds}.");
-                    return new DriverMatchResult(driver)
-                    {
-                        MatchedHardwareId = hardwareId,
-                        MatchedVersion = matched.Candidate.Version,
-                        MatchedFeatureScore = matched.FeatureScore,
-                        MatchedComputerHardwareId = matched.ComputerHardwareId
-                    };
+                    matchedCount++;
                 }
             }
 
             stopwatch.Stop();
             Trace.TraceInformation(
-                $"Client driver match: hardware_ids={normalizedHardwareIds.Count}, " +
-                $"candidates={candidateCount}, selected_package=none, total_ms={stopwatch.ElapsedMilliseconds}.");
+                $"Client driver batch: devices={requestedDevices.Count}, matched={matchedCount}, " +
+                $"unique_packages={responseProjectionByPackage.Count}, total_ms={stopwatch.ElapsedMilliseconds}.");
+            return results;
+        }
+
+        private ClientSyncDriverMatchRecord MatchDriver(
+            SqliteConnection connection,
+            IEnumerable<string> hardwareIds,
+            IReadOnlyList<Guid> computerHardwareIds,
+            IDictionary<int, ClientSyncResponseProjection> responseProjectionByPackage)
+        {
+            var normalizedHardwareIds = (hardwareIds ?? Array.Empty<string>())
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Select(value => value.Trim().ToLowerInvariant())
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+
+            foreach (var hardwareId in normalizedHardwareIds)
+            {
+                var candidates = ReadDriverCandidates(connection, hardwareId);
+                if (candidates.Count == 0)
+                {
+                    continue;
+                }
+
+                var matched = MatchDriverCandidates(candidates, computerHardwareIds);
+                if (matched == null)
+                {
+                    continue;
+                }
+
+                var driver = LoadPackageByIndex(
+                    connection,
+                    matched.Candidate.PackageIndex) as DriverUpdate;
+                if (driver == null)
+                {
+                    continue;
+                }
+
+                if (!responseProjectionByPackage.TryGetValue(
+                    matched.Candidate.PackageIndex,
+                    out var responseProjection))
+                {
+                    responseProjection = ReadClientSyncResponseProjection(
+                        connection,
+                        matched.Candidate.PackageIndex);
+                    if (responseProjection == null)
+                    {
+                        continue;
+                    }
+
+                    responseProjectionByPackage.Add(
+                        matched.Candidate.PackageIndex,
+                        responseProjection);
+                }
+
+                var matchResult = new DriverMatchResult(driver)
+                {
+                    MatchedHardwareId = hardwareId,
+                    MatchedVersion = matched.Candidate.Version,
+                    MatchedFeatureScore = matched.FeatureScore,
+                    MatchedComputerHardwareId = matched.ComputerHardwareId
+                };
+                return new ClientSyncDriverMatchRecord(
+                    matchResult,
+                    responseProjection.RevisionId,
+                    responseProjection.CoreXml);
+            }
+
             return null;
         }
 
@@ -710,7 +831,27 @@ LIMIT 1;";
                     isBundled);
         }
 
-        private static string BuildSoftwareCandidateQuery(ClientSyncSoftwareStage stage)
+        private static ClientSyncResponseProjection ReadClientSyncResponseProjection(
+            SqliteConnection connection,
+            int packageIndex)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+SELECT fragment.core_xml
+FROM client_sync_fragments AS fragment
+JOIN packages AS package
+  ON package.package_index = fragment.package_index
+ AND package.published = 1
+WHERE fragment.package_index = $packageIndex
+LIMIT 1;";
+            command.Parameters.AddWithValue("$packageIndex", packageIndex);
+            var value = command.ExecuteScalar();
+            return value == null || value == DBNull.Value
+                ? null
+                : new ClientSyncResponseProjection(packageIndex, (string)value);
+        }
+
+        private static string BuildSoftwareCandidateQuery(ClientSyncSoftwareStage stage, bool includeCoreXml)
         {
             var stagePredicate = stage switch
             {
@@ -750,15 +891,21 @@ AND NOT EXISTS (
     HAVING COUNT(installed.value) = 0
 )";
 
+            var coreProjection = includeCoreXml ? ",\n    fragment.core_xml" : string.Empty;
+            var fragmentJoin = includeCoreXml
+                ? "JOIN client_sync_fragments AS fragment ON fragment.package_index = graph.package_index"
+                : string.Empty;
+
             return $@"
 SELECT
     graph.package_index,
     graph.is_bundle,
-    graph.is_bundled
+    graph.is_bundled{coreProjection}
 FROM client_sync_graph AS graph
 JOIN packages AS package
   ON package.package_index = graph.package_index
  AND package.published = 1
+{fragmentJoin}
 LEFT JOIN temp_client_sync_excluded AS excluded
   ON excluded.value = graph.update_id
 LEFT JOIN temp_client_sync_approved AS approved
@@ -1470,6 +1617,7 @@ WHERE type = 'table'
             {
                 "packages",
                 "client_sync_packages",
+                "client_sync_fragments",
                 "client_sync_graph",
                 "client_sync_prerequisites",
                 "client_sync_supersedence",
@@ -1544,6 +1692,18 @@ WHERE name = 'published';";
             {
                 PackageIndex = packageIndex;
                 MetadataBytes = metadataBytes ?? Array.Empty<byte>();
+            }
+        }
+
+        private sealed class ClientSyncResponseProjection
+        {
+            public int RevisionId { get; }
+            public string CoreXml { get; }
+
+            public ClientSyncResponseProjection(int revisionId, string coreXml)
+            {
+                RevisionId = revisionId;
+                CoreXml = coreXml ?? throw new ArgumentNullException(nameof(coreXml));
             }
         }
 

@@ -31,7 +31,6 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
 
         private Config ServiceConfiguration;
         private const int MaxUpdatesInResponse = 50;
-        private static readonly SemaphoreSlim ScanConcurrencyGate = new(1, 1);
         private static long ScanSequence;
         private string ContentRoot;
 
@@ -434,15 +433,9 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
             parameters ??= new SyncUpdateParameters();
             var scanId = Interlocked.Increment(ref ScanSequence);
             var scanType = parameters.SkipSoftwareSync ? "drivers" : "software";
-            var queueStopwatch = Stopwatch.StartNew();
-            await ScanConcurrencyGate.WaitAsync().ConfigureAwait(false);
-            queueStopwatch.Stop();
-
             var totalStopwatch = Stopwatch.StartNew();
-            using var process = Process.GetCurrentProcess();
-            var cpuBefore = process.TotalProcessorTime;
             Trace.TraceInformation(
-                $"Client scan {scanId} started: type={scanType}, queue_ms={queueStopwatch.ElapsedMilliseconds}, " +
+                $"Client scan {scanId} started: type={scanType}, " +
                 $"devices={parameters.SystemSpec?.Length ?? 0}, installed_non_leaf={parameters.InstalledNonLeafUpdateIDs?.Length ?? 0}, " +
                 $"other_cached={parameters.OtherCachedUpdateIDs?.Length ?? 0}, cached_drivers={parameters.CachedDriverIDs?.Length ?? 0}.");
 
@@ -471,11 +464,9 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
             finally
             {
                 totalStopwatch.Stop();
-                var cpuUsed = process.TotalProcessorTime - cpuBefore;
                 Trace.TraceInformation(
-                    $"Client scan {scanId} completed: type={scanType}, total_ms={totalStopwatch.ElapsedMilliseconds}, " +
-                    $"process_cpu_ms={cpuUsed.TotalMilliseconds:F0}.");
-                ScanConcurrencyGate.Release();
+                    $"Client scan {scanId} completed: type={scanType}, " +
+                    $"total_ms={totalStopwatch.ElapsedMilliseconds}.");
             }
         }
 

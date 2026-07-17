@@ -3,6 +3,7 @@
 
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Drivers;
+using Microsoft.PackageGraph.Storage;
 using Microsoft.UpdateServices.WebServices.ClientSync;
 using System;
 using System.Collections.Generic;
@@ -45,6 +46,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                 Truncated = false
             };
 
+            var deviceInputs = new List<(Device Device, List<string> HardwareIds)>();
             foreach (var device in parameters.SystemSpec ?? Array.Empty<Device>())
             {
                 if (device == null)
@@ -59,12 +61,47 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                     hardwareIdsToMatch.AddRange(device.CompatibleIDs);
                 }
 
-                var driverMatchResult = MetadataSource.MatchDriver(
-                    hardwareIdsToMatch,
-                    computerHardwareIds,
-                    installedNonLeaf);
-                if (driverMatchResult == null
-                    || cachedDrivers.Contains(driverMatchResult.Driver.Id)
+                deviceInputs.Add((device, hardwareIdsToMatch));
+            }
+
+            var projectionStore = MetadataSource as IClientSyncProjectionStore;
+            var matchRecords = projectionStore?.MatchDrivers(
+                deviceInputs
+                    .Select(input => new ClientSyncDriverMatchRequest(input.HardwareIds))
+                    .ToList(),
+                computerHardwareIds,
+                installedNonLeaf);
+
+            for (var deviceIndex = 0; deviceIndex < deviceInputs.Count; deviceIndex++)
+            {
+                var device = deviceInputs[deviceIndex].Device;
+                var hardwareIdsToMatch = deviceInputs[deviceIndex].HardwareIds;
+                ClientSyncDriverMatchRecord matchRecord = null;
+                DriverMatchResult driverMatchResult;
+                if (projectionStore != null)
+                {
+                    matchRecord = matchRecords != null && deviceIndex < matchRecords.Count
+                        ? matchRecords[deviceIndex]
+                        : null;
+                    if (matchRecord == null)
+                    {
+                        continue;
+                    }
+
+                    driverMatchResult = matchRecord.MatchResult;
+                }
+                else
+                {
+                    driverMatchResult = MetadataSource.MatchDriver(
+                        hardwareIdsToMatch,
+                        computerHardwareIds,
+                        installedNonLeaf);
+                    if (driverMatchResult == null)
+                    {
+                        continue;
+                    }
+                }
+                if (cachedDrivers.Contains(driverMatchResult.Driver.Id)
                     || (device.installedDriver != null
                         && IsInstalledDriverBetterMatch(
                             device.installedDriver,
@@ -81,7 +118,8 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                     continue;
                 }
 
-                var revisionId = MetadataSource.GetRevisionId(driverMatchResult.Driver.Id);
+                var revisionId = matchRecord?.RevisionId
+                    ?? MetadataSource.GetRevisionId(driverMatchResult.Driver.Id);
                 if (revisionId < 0 || !addedRevisionIds.Add(revisionId))
                 {
                     continue;
@@ -101,7 +139,8 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                     },
                     ID = revisionId,
                     IsLeaf = true,
-                    Xml = GetCoreFragment(driverMatchResult.Driver.Id),
+                    Xml = matchRecord?.CoreXml
+                        ?? GetCoreFragment(driverMatchResult.Driver.Id),
                     IsShared = false,
                     Verification = null
                 });

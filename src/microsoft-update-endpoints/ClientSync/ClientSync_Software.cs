@@ -83,25 +83,56 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
             SyncInfo response,
             bool nonLeafResponse)
         {
-            var packages = MetadataSource.GetSoftwareCandidates(
-                stage,
-                installedNonLeaf,
-                otherCached,
-                AreAllSoftwareUpdatesApproved,
-                ApprovedSoftwareUpdates.ToArray(),
-                MaxUpdatesInResponse,
-                out var truncated);
-
-            if (packages.Count == 0)
+            GetSoftwareApprovalSnapshot(
+                out var approveAllSoftwareUpdates,
+                out var approvedSoftwareUpdates);
+            bool truncated;
+            if (MetadataSource is IClientSyncProjectionStore projectionStore)
             {
-                System.Diagnostics.Trace.TraceInformation(
-                    $"Client software stage {stage}: no candidate returned.");
-                return false;
-            }
+                var records = projectionStore.GetSoftwareCandidateProjections(
+                    stage,
+                    installedNonLeaf,
+                    otherCached,
+                    approveAllSoftwareUpdates,
+                    approvedSoftwareUpdates,
+                    MaxUpdatesInResponse,
+                    out truncated);
 
-            response.NewUpdates = nonLeafResponse
-                ? CreateUpdateInfoListFromNonLeafUpdates(packages).ToArray()
-                : CreateUpdateInfoListFromSoftwareUpdates(packages).ToArray();
+                if (records.Count == 0)
+                {
+                    System.Diagnostics.Trace.TraceInformation(
+                        $"Client software stage {stage}: no candidate returned.");
+                    return false;
+                }
+
+                response.NewUpdates = nonLeafResponse
+                    ? CreateUpdateInfoListFromNonLeafUpdates(records).ToArray()
+                    : CreateUpdateInfoListFromSoftwareUpdates(records).ToArray();
+            }
+            else
+            {
+                // Preserve the historical path for custom metadata-store
+                // implementations that do not provide persisted projections.
+                var packages = MetadataSource.GetSoftwareCandidates(
+                    stage,
+                    installedNonLeaf,
+                    otherCached,
+                    approveAllSoftwareUpdates,
+                    approvedSoftwareUpdates,
+                    MaxUpdatesInResponse,
+                    out truncated);
+
+                if (packages.Count == 0)
+                {
+                    System.Diagnostics.Trace.TraceInformation(
+                        $"Client software stage {stage}: no candidate returned.");
+                    return false;
+                }
+
+                response.NewUpdates = nonLeafResponse
+                    ? CreateUpdateInfoListFromNonLeafUpdates(packages).ToArray()
+                    : CreateUpdateInfoListFromSoftwareUpdates(packages).ToArray();
+            }
 
             // Match the historical in-memory implementation: every non-leaf
             // discovery stage must force another SyncUpdates call so WUA can
@@ -115,6 +146,65 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                 $"sql_truncated={truncated}, response_truncated={response.Truncated}.");
             return true;
         }
+
+        private List<UpdateInfo> CreateUpdateInfoListFromSoftwareUpdates(
+            IReadOnlyList<ClientSyncSoftwareCandidateRecord> records)
+        {
+            var result = new List<UpdateInfo>(records.Count);
+            foreach (var record in records)
+            {
+                var action = record.IsBundle || !record.IsBundled
+                    ? DeploymentAction.Install
+                    : DeploymentAction.Bundle;
+
+                result.Add(new UpdateInfo
+                {
+                    Deployment = new Deployment
+                    {
+                        Action = action,
+                        ID = record.IsBundle ? 20000 : (record.IsBundled ? 20001 : 20002),
+                        AutoDownload = "0",
+                        AutoSelect = "0",
+                        SupersedenceBehavior = "0",
+                        IsAssigned = true,
+                        LastChangeTime = "2019-08-06"
+                    },
+                    IsLeaf = true,
+                    ID = record.RevisionId,
+                    IsShared = false,
+                    Verification = null,
+                    Xml = record.CoreXml
+                });
+            }
+
+            return result;
+        }
+
+        private List<UpdateInfo> CreateUpdateInfoListFromNonLeafUpdates(
+            IReadOnlyList<ClientSyncSoftwareCandidateRecord> records)
+        {
+            return records
+                .Select(record => new UpdateInfo
+                {
+                    Deployment = new Deployment
+                    {
+                        Action = DeploymentAction.Evaluate,
+                        ID = 15000,
+                        AutoDownload = "0",
+                        AutoSelect = "0",
+                        SupersedenceBehavior = "0",
+                        IsAssigned = true,
+                        LastChangeTime = "2019-08-06"
+                    },
+                    IsLeaf = false,
+                    ID = record.RevisionId,
+                    IsShared = false,
+                    Verification = null,
+                    Xml = record.CoreXml
+                })
+                .ToList();
+        }
+
 
         private List<UpdateInfo> CreateUpdateInfoListFromSoftwareUpdates(
             IReadOnlyList<ClientSyncPackageRecord> records)

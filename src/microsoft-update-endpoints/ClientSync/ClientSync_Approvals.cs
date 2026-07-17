@@ -3,6 +3,7 @@
 
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
 {
@@ -10,6 +11,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
     public partial class ClientSyncWebService
     {
         readonly private HashSet<MicrosoftUpdatePackageIdentity> ApprovedSoftwareUpdates;
+        readonly private object ApprovalLock = new();
         private bool AreAllSoftwareUpdatesApproved = true;
 
         private enum DriverApprovalMode
@@ -48,8 +50,11 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         /// <param name="approvedUpdate">Approved update</param>
         public void AddApprovedSoftwareUpdate(MicrosoftUpdatePackageIdentity approvedUpdate)
         {
-            AreAllSoftwareUpdatesApproved = false;
-            ApprovedSoftwareUpdates.Add(approvedUpdate);
+            lock (ApprovalLock)
+            {
+                AreAllSoftwareUpdatesApproved = false;
+                ApprovedSoftwareUpdates.Add(approvedUpdate);
+            }
         }
 
         /// <summary>
@@ -59,10 +64,13 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         /// <param name="approvedUpdates">List of approved updates</param>
         public void AddApprovedSoftwareUpdates(IEnumerable<MicrosoftUpdatePackageIdentity> approvedUpdates)
         {
-            AreAllSoftwareUpdatesApproved = false;
-            foreach (var approvedUpdate in approvedUpdates)
+            lock (ApprovalLock)
             {
-                ApprovedSoftwareUpdates.Add(approvedUpdate);
+                AreAllSoftwareUpdatesApproved = false;
+                foreach (var approvedUpdate in approvedUpdates)
+                {
+                    ApprovedSoftwareUpdates.Add(approvedUpdate);
+                }
             }
         }
 
@@ -72,6 +80,14 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         /// </summary>
         /// <param name="approvedUpdate">Approved driver update</param>
         public void AddApprovedDriverUpdate(MicrosoftUpdatePackageIdentity approvedUpdate)
+        {
+            lock (ApprovalLock)
+            {
+                AddApprovedDriverUpdateUnsafe(approvedUpdate);
+            }
+        }
+
+        private void AddApprovedDriverUpdateUnsafe(MicrosoftUpdatePackageIdentity approvedUpdate)
         {
             if (DriverApprovals == DriverApprovalMode.All)
             {
@@ -96,9 +112,12 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         /// <param name="approvedUpdates"></param>
         public void AddApprovedDriverUpdates(IEnumerable<MicrosoftUpdatePackageIdentity> approvedUpdates)
         {
-            foreach (var approvedUpdate in approvedUpdates)
+            lock (ApprovalLock)
             {
-                AddApprovedDriverUpdate(approvedUpdate);
+                foreach (var approvedUpdate in approvedUpdates)
+                {
+                    AddApprovedDriverUpdateUnsafe(approvedUpdate);
+                }
             }
         }
 
@@ -109,7 +128,10 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         /// <param name="updateIdentity">Identity of update to un-approve</param>
         public void RemoveApprovedSoftwareUpdate(MicrosoftUpdatePackageIdentity updateIdentity)
         {
-            ApprovedSoftwareUpdates.Remove(updateIdentity);
+            lock (ApprovalLock)
+            {
+                ApprovedSoftwareUpdates.Remove(updateIdentity);
+            }
         }
 
         /// <summary>
@@ -119,19 +141,22 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         /// <param name="updateIdentity">Identity of update to un-approve</param>
         public void RemoveApprovedDriverUpdate(MicrosoftUpdatePackageIdentity updateIdentity)
         {
-            if (DriverApprovals == DriverApprovalMode.All)
+            lock (ApprovalLock)
             {
-                DriverApprovals = DriverApprovalMode.DenyList;
-                DeniedDriverUpdates.Clear();
-            }
+                if (DriverApprovals == DriverApprovalMode.All)
+                {
+                    DriverApprovals = DriverApprovalMode.DenyList;
+                    DeniedDriverUpdates.Clear();
+                }
 
-            if (DriverApprovals == DriverApprovalMode.AllowList)
-            {
-                ApprovedDriverUpdates.Remove(updateIdentity);
-            }
-            else
-            {
-                DeniedDriverUpdates.Add(updateIdentity);
+                if (DriverApprovals == DriverApprovalMode.AllowList)
+                {
+                    ApprovedDriverUpdates.Remove(updateIdentity);
+                }
+                else
+                {
+                    DeniedDriverUpdates.Add(updateIdentity);
+                }
             }
         }
 
@@ -141,20 +166,37 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         /// </summary>
         public void ClearApprovedDriverUpdates()
         {
-            DriverApprovals = DriverApprovalMode.AllowList;
-            ApprovedDriverUpdates.Clear();
-            DeniedDriverUpdates.Clear();
+            lock (ApprovalLock)
+            {
+                DriverApprovals = DriverApprovalMode.AllowList;
+                ApprovedDriverUpdates.Clear();
+                DeniedDriverUpdates.Clear();
+            }
         }
 
         private bool IsDriverUpdateApproved(MicrosoftUpdatePackageIdentity updateIdentity)
         {
-            return DriverApprovals switch
+            lock (ApprovalLock)
             {
-                DriverApprovalMode.All => true,
-                DriverApprovalMode.AllowList => ApprovedDriverUpdates.Contains(updateIdentity),
-                DriverApprovalMode.DenyList => !DeniedDriverUpdates.Contains(updateIdentity),
-                _ => false
-            };
+                return DriverApprovals switch
+                {
+                    DriverApprovalMode.All => true,
+                    DriverApprovalMode.AllowList => ApprovedDriverUpdates.Contains(updateIdentity),
+                    DriverApprovalMode.DenyList => !DeniedDriverUpdates.Contains(updateIdentity),
+                    _ => false
+                };
+            }
+        }
+
+        private void GetSoftwareApprovalSnapshot(
+            out bool approveAllSoftwareUpdates,
+            out MicrosoftUpdatePackageIdentity[] approvedSoftwareUpdates)
+        {
+            lock (ApprovalLock)
+            {
+                approveAllSoftwareUpdates = AreAllSoftwareUpdatesApproved;
+                approvedSoftwareUpdates = ApprovedSoftwareUpdates.ToArray();
+            }
         }
 
         /// <summary>
@@ -163,7 +205,10 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         /// </summary>
         public void ClearApprovedSoftwareUpdates()
         {
-            ApprovedSoftwareUpdates.Clear();
+            lock (ApprovalLock)
+            {
+                ApprovedSoftwareUpdates.Clear();
+            }
         }
     }
 }

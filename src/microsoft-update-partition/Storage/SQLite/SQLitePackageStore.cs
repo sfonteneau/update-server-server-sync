@@ -38,7 +38,7 @@ namespace Microsoft.PackageGraph.Storage.Local
     {
         public const string DatabaseFileName = "metadata.sqlite";
 
-        private const int SchemaVersion = 9;
+        private const int SchemaVersion = 10;
         private const string IndexBlobKey = "indexes.zip";
         private const string CompressionNone = "none";
         private const string CompressionBrotli = "br";
@@ -140,6 +140,7 @@ namespace Microsoft.PackageGraph.Storage.Local
             }
             else
             {
+                ClientSyncFragmentSchemaMigrator.TryMigrate(Connection);
                 ValidateExistingSchema();
             }
 
@@ -216,6 +217,12 @@ CREATE TABLE IF NOT EXISTS client_sync_packages (
 
 CREATE INDEX IF NOT EXISTS idx_client_sync_packages_update
 ON client_sync_packages(update_id, revision_number, package_index);
+
+CREATE TABLE IF NOT EXISTS client_sync_fragments (
+    package_index INTEGER PRIMARY KEY,
+    core_xml TEXT NOT NULL,
+    FOREIGN KEY(package_index) REFERENCES packages(package_index) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS client_sync_graph (
     package_index INTEGER PRIMARY KEY,
@@ -526,6 +533,7 @@ WHERE type = 'table'
             {
                 "packages",
                 "client_sync_packages",
+                "client_sync_fragments",
                 "client_sync_graph",
                 "client_sync_prerequisites",
                 "client_sync_supersedence",
@@ -3435,7 +3443,12 @@ WHERE sha1_base64 = $sha1;";
                     // Do not store the full per-package file list here. File metadata is deduplicated
                     // by SHA1 in file_locations and associated to packages through package_file_map.
                     InsertPackage(package, packageIndex, packageType, metadataStorage.Bytes, metadataStorage.Compression, null, transaction);
-                    InsertClientSyncMetadata(package, packageIndex, transaction);
+                    InsertClientSyncMetadata(
+                        package,
+                        packageIndex,
+                        metadataStorage.Bytes,
+                        metadataStorage.Compression,
+                        transaction);
                     InsertFileLocations(package, packageIndex, transaction);
 
                     stagedPackages.Add(new StagedPackage
@@ -3623,11 +3636,29 @@ VALUES ($packageIndex, $partition, $openIdHex, $identity, $packageType, $publish
             command.ExecuteNonQuery();
         }
 
-        private void InsertClientSyncMetadata(IPackage package, int packageIndex, SqliteTransaction transaction)
+        private void InsertClientSyncMetadata(
+            IPackage package,
+            int packageIndex,
+            byte[] metadataBytes,
+            string metadataCompression,
+            SqliteTransaction transaction)
         {
             if (package is not MicrosoftUpdatePackage microsoftUpdatePackage)
             {
                 return;
+            }
+
+            var uncompressedMetadata = DecompressBytes(metadataBytes, metadataCompression);
+            var coreXml = ClientSyncCoreFragmentBuilder.Build(uncompressedMetadata);
+            using (var fragmentCommand = Connection.CreateCommand())
+            {
+                fragmentCommand.Transaction = transaction;
+                fragmentCommand.CommandText = @"
+INSERT INTO client_sync_fragments(package_index, core_xml)
+VALUES ($packageIndex, $coreXml);";
+                fragmentCommand.Parameters.AddWithValue("$packageIndex", packageIndex);
+                fragmentCommand.Parameters.AddWithValue("$coreXml", coreXml);
+                fragmentCommand.ExecuteNonQuery();
             }
 
             using (var packageCommand = Connection.CreateCommand())

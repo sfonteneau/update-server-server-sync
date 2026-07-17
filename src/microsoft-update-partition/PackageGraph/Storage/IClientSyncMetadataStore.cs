@@ -7,6 +7,7 @@ using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Drivers;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 
 namespace Microsoft.PackageGraph.Storage
 {
@@ -42,6 +43,63 @@ namespace Microsoft.PackageGraph.Storage
             Package = package ?? throw new ArgumentNullException(nameof(package));
             IsBundle = isBundle;
             IsBundled = isBundled;
+        }
+    }
+
+
+    /// <summary>
+    /// A lightweight software-discovery row containing only the values required
+    /// to build the client response. The Core XML is precomputed during import.
+    /// </summary>
+    public sealed class ClientSyncSoftwareCandidateRecord
+    {
+        public int RevisionId { get; }
+        public string CoreXml { get; }
+        public bool IsBundle { get; }
+        public bool IsBundled { get; }
+
+        public ClientSyncSoftwareCandidateRecord(
+            int revisionId,
+            string coreXml,
+            bool isBundle,
+            bool isBundled)
+        {
+            RevisionId = revisionId;
+            CoreXml = coreXml ?? throw new ArgumentNullException(nameof(coreXml));
+            IsBundle = isBundle;
+            IsBundled = isBundled;
+        }
+    }
+
+    /// <summary>A device's ordered hardware IDs for one driver lookup.</summary>
+    public sealed class ClientSyncDriverMatchRequest
+    {
+        public IReadOnlyList<string> HardwareIds { get; }
+
+        public ClientSyncDriverMatchRequest(IEnumerable<string> hardwareIds)
+        {
+            HardwareIds = hardwareIds as IReadOnlyList<string>
+                ?? (hardwareIds ?? Array.Empty<string>()).ToList();
+        }
+    }
+
+    /// <summary>
+    /// A driver match plus the precomputed response values for the selected package.
+    /// </summary>
+    public sealed class ClientSyncDriverMatchRecord
+    {
+        public DriverMatchResult MatchResult { get; }
+        public int RevisionId { get; }
+        public string CoreXml { get; }
+
+        public ClientSyncDriverMatchRecord(
+            DriverMatchResult matchResult,
+            int revisionId,
+            string coreXml)
+        {
+            MatchResult = matchResult ?? throw new ArgumentNullException(nameof(matchResult));
+            RevisionId = revisionId;
+            CoreXml = coreXml ?? throw new ArgumentNullException(nameof(coreXml));
         }
     }
 
@@ -140,4 +198,35 @@ namespace Microsoft.PackageGraph.Storage
         /// <summary>Resolves requested SHA-1 digests to URLs from published packages.</summary>
         IReadOnlyList<ClientSyncFileLocationRecord> GetFileLocations(IEnumerable<byte[]> sha1Digests);
     }
+
+    /// <summary>
+    /// Optional optimized read model implemented by stores that persist client-sync
+    /// response projections. Existing IClientSyncMetadataStore implementations remain
+    /// source-compatible and continue to use the historical fallback path.
+    /// </summary>
+    public interface IClientSyncProjectionStore : IClientSyncMetadataStore
+    {
+        /// <summary>
+        /// Selects lightweight software response rows with precomputed Core XML.
+        /// </summary>
+        IReadOnlyList<ClientSyncSoftwareCandidateRecord> GetSoftwareCandidateProjections(
+            ClientSyncSoftwareStage stage,
+            IReadOnlyCollection<Guid> installedNonLeafUpdateIds,
+            IReadOnlyCollection<Guid> otherCachedUpdateIds,
+            bool approveAllSoftwareUpdates,
+            IReadOnlyCollection<MicrosoftUpdatePackageIdentity> approvedSoftwareUpdates,
+            int maxResults,
+            out bool truncated);
+
+        /// <summary>
+        /// Finds the best published driver for multiple devices using one SQLite
+        /// connection. The returned list is aligned with the requests and may
+        /// contain null entries.
+        /// </summary>
+        IReadOnlyList<ClientSyncDriverMatchRecord> MatchDrivers(
+            IReadOnlyList<ClientSyncDriverMatchRequest> requests,
+            IEnumerable<Guid> computerHardwareIds,
+            IReadOnlyCollection<Guid> installedPrerequisites);
+    }
+
 }
